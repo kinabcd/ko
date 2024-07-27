@@ -60,8 +60,7 @@ type Options struct {
 	// is used.
 	PublicSuffixList PublicSuffixList
 
-	// Filename holds the file to use for storage of the cookies.
-	// If it is empty, the value of DefaultCookieFile will be used.
+	// If it is not empty, we will load cookies from file.
 	Filename string
 }
 
