@@ -11,6 +11,7 @@ var (
 	_ Listener      = &pipeListener{}
 	_ Dialer        = &pipeListener{}
 	_ ContextDialer = &pipeListener{}
+	_ Forwarder     = &pipeListener{}
 )
 
 type pipeListener struct {
@@ -82,6 +83,24 @@ func (l *pipeListener) DialContext(ctx context.Context, network, addr string) (c
 	case <-l.close:
 		c0.Close()
 		c1.Close()
+		e = net.ErrClosed
+	}
+	return
+}
+
+func (l *pipeListener) Forward(ctx context.Context, conn net.Conn) (e error) {
+	// check closed
+	if atomic.LoadUint32(&l.done) != 0 {
+		e = net.ErrClosed
+		return
+	}
+	// waiting accepted or closed or done
+	select {
+	case <-ctx.Done():
+		e = ctx.Err()
+	case l.ch <- conn:
+	case <-l.close:
+		conn.Close()
 		e = net.ErrClosed
 	}
 	return
