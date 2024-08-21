@@ -2,9 +2,9 @@ package socks_test
 
 import (
 	"context"
+	"io"
 	"net"
 	"testing"
-	"time"
 
 	koNet "github.com/kinabcd/ko/net"
 	"github.com/kinabcd/ko/net/socks"
@@ -15,25 +15,26 @@ import (
 type recordDialer struct {
 	Network string
 	Address string
-	Content []byte
+	Content chan []byte
 }
 
+func newRecord() *recordDialer {
+	return &recordDialer{
+		Content: make(chan []byte),
+	}
+}
 func (record *recordDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	record.Network = network
 	record.Address = address
 	c1, c2 := net.Pipe()
 	go func() {
-		buffer := make([]byte, 1024)
-		if n, err := c2.Read(buffer); err != nil {
-			return
-		} else {
-			record.Content = append(record.Content, buffer[:n]...)
-		}
+		content, _ := io.ReadAll(c2)
+		record.Content <- content
 	}()
 	return c1, nil
 }
 func TestSock5Server(t *testing.T) {
-	record := &recordDialer{}
+	record := newRecord()
 	socks5 := &socks.Server{
 		Dialer: record,
 	}
@@ -44,15 +45,15 @@ func TestSock5Server(t *testing.T) {
 	c, err := dialer.Dial("tcp", "example.tw:9999")
 	koTesting.AssertNoError(t, err)
 	outContent := []byte("YOYOYO")
-	c.Write(outContent)
+	c.Write(outContent[:3])
+	c.Write(outContent[3:])
 	c.Close()
-	time.Sleep(1 * time.Second)
 	koTesting.AssertEquals(t, "example.tw:9999", record.Address)
-	koTesting.AssertSliceEquals(t, outContent, record.Content)
+	koTesting.AssertSliceEquals(t, outContent, <-record.Content)
 }
 
 func TestSock5ServerPassword(t *testing.T) {
-	record := &recordDialer{}
+	record := newRecord()
 	socks5 := &socks.Server{
 		Dialer: record,
 		AuthHandler: func(username, password string) bool {
@@ -83,7 +84,6 @@ func TestSock5ServerPassword(t *testing.T) {
 	outContent := []byte("YOYOYO")
 	c.Write(outContent)
 	c.Close()
-	time.Sleep(1 * time.Second)
 	koTesting.AssertEquals(t, "example.tw:9999", record.Address)
-	koTesting.AssertSliceEquals(t, outContent, record.Content)
+	koTesting.AssertSliceEquals(t, outContent, <-record.Content)
 }
