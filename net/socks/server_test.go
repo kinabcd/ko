@@ -6,37 +6,27 @@ import (
 	"net"
 	"testing"
 
+	koIo "github.com/kinabcd/ko/io"
 	koNet "github.com/kinabcd/ko/net"
 	"github.com/kinabcd/ko/net/socks"
 	koTesting "github.com/kinabcd/ko/testing"
 	"golang.org/x/net/proxy"
 )
 
-type recordDialer struct {
-	Network string
-	Address string
-	Content chan []byte
-}
+type echoDialer struct{}
 
-func newRecord() *recordDialer {
-	return &recordDialer{
-		Content: make(chan []byte),
-	}
-}
-func (record *recordDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
-	record.Network = network
-	record.Address = address
+func (echo *echoDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	c1, c2 := net.Pipe()
 	go func() {
-		content, _ := io.ReadAll(c2)
-		record.Content <- content
+		content, _ := koIo.ReadCString(c2)
+		c2.Write([]byte(network + ":" + address + ":" + content))
+		c2.Close()
 	}()
 	return c1, nil
 }
 func TestSock5Server(t *testing.T) {
-	record := newRecord()
 	socks5 := &socks.Server{
-		Dialer: record,
+		Dialer: &echoDialer{},
 	}
 	lp := koNet.ListenPipe()
 	go socks5.Serve(lp)
@@ -47,15 +37,15 @@ func TestSock5Server(t *testing.T) {
 	outContent := []byte("YOYOYO")
 	c.Write(outContent[:3])
 	c.Write(outContent[3:])
+	c.Write([]byte{0})
+	content, _ := io.ReadAll(c)
 	c.Close()
-	koTesting.AssertEquals(t, "example.tw:9999", record.Address)
-	koTesting.AssertSliceEquals(t, outContent, <-record.Content)
+	koTesting.AssertEquals(t, "tcp:example.tw:9999:YOYOYO", string(content))
 }
 
 func TestSock5ServerPassword(t *testing.T) {
-	record := newRecord()
 	socks5 := &socks.Server{
-		Dialer: record,
+		Dialer: &echoDialer{},
 		AuthHandler: func(username, password string) bool {
 			return username == "123" && password == "456"
 		},
@@ -83,7 +73,8 @@ func TestSock5ServerPassword(t *testing.T) {
 	koTesting.AssertNoError(t, err)
 	outContent := []byte("YOYOYO")
 	c.Write(outContent)
+	c.Write([]byte{0})
+	content, _ := io.ReadAll(c)
 	c.Close()
-	koTesting.AssertEquals(t, "example.tw:9999", record.Address)
-	koTesting.AssertSliceEquals(t, outContent, <-record.Content)
+	koTesting.AssertEquals(t, "tcp:example.tw:9999:YOYOYO", string(content))
 }

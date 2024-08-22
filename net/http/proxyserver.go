@@ -84,7 +84,9 @@ func (p *ProxyServer) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 		}
 		if !ok {
 			wr.Header().Add("Proxy-Authenticate", "Basic")
-			p.getLogger().Println("HttpProxy", status, pau, pap)
+			if p.Verbose {
+				p.getLogger().Println("HttpProxy", status, pau, pap)
+			}
 			http.Error(wr, "", status)
 			return
 		}
@@ -171,12 +173,13 @@ func (p *ProxyServer) serveConnect(wr http.ResponseWriter, req *http.Request) {
 		defer outConn.Close()
 		wr.WriteHeader(http.StatusOK)
 		rc := http.NewResponseController(wr)
-		conn, _, err := rc.Hijack()
+
+		conn, brf, err := rc.Hijack()
 		if err != nil {
 			return
 		}
 		defer conn.Close()
-		koIo.BidirectionalCopy(conn, outConn)
+		koIo.BidirectionalCopy(&koNet.PrefixConn{Prefix: brf.Reader, Conn: conn}, outConn)
 	} else {
 		wr.WriteHeader(http.StatusNotFound)
 		p.getLogger().Printf("HttpProxy dial failed %v", err)
