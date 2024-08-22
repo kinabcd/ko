@@ -13,12 +13,22 @@ import (
 	koTime "github.com/kinabcd/ko/time"
 )
 
+// A Server defines parameters for running an SOCKS4/SOCKS5 server.
+// The zero value for Server is a valid configuration.
 type Server struct {
-	Logger  *log.Logger
-	Dialer  koNet.ContextDialer
+	// Dialer specifies an optional ContextDialer.
+	// If non-nil, it will be used on outbound.
+	Dialer koNet.ContextDialer
+
+	// Logger specifies an optional logger for errors.
+	// If nil, logging is done via the log package's standard logger.
+	Logger *log.Logger
+
+	// Log non-error messages if Verbose is true.
 	Verbose bool
 
-	// handle authorization. AuthMethodNotRequired if nil
+	// Handle authorization. AuthMethodNotRequired if nil
+	// If AuthHandler is not nil, SOCKS4(a) server will not serve.
 	AuthHandler func(username, password string) bool
 }
 
