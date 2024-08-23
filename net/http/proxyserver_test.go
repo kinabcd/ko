@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -51,8 +50,7 @@ func (record *echoHttpDialer) DialContext(ctx context.Context, network, address 
 		c2 = tls.Server(c2, &tls.Config{Certificates: []tls.Certificate{tlsCert}})
 	}
 	go func() {
-		r, err := http.ReadRequest(bufio.NewReader(c2))
-		fmt.Println(err)
+		r, _ := http.ReadRequest(bufio.NewReader(c2))
 		(&http.Response{
 			StatusCode:    200,
 			ProtoMajor:    r.ProtoMajor,
@@ -109,7 +107,7 @@ func TestProxyServerPassword(t *testing.T) {
 	}
 	var err error
 	res, _ := client.Get("http://example.tw:9999/")
-	koTesting.Assert(t, res.StatusCode != http.StatusForbidden, "expect error for no auth")
+	koTesting.Assert(t, res.StatusCode == http.StatusProxyAuthRequired, "expect error for no auth")
 	_, err = client.Get("https://example.tw:443/")
 	koTesting.Assert(t, err != nil, "expect error for no auth")
 	transport.Proxy = func(r *http.Request) (*url.URL, error) {

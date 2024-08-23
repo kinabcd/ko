@@ -77,17 +77,13 @@ func (p *ProxyServer) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 	if p.AuthHandler != nil {
 		pa := req.Header.Get("Proxy-Authorization")
 		pau, pap, ok := DecodeBasicAuth(pa)
-		status := http.StatusProxyAuthRequired
-		if ok && !p.AuthHandler(pau, pap) {
-			status = http.StatusForbidden
-			ok = false
-		}
+		ok = ok && p.AuthHandler(pau, pap)
 		if !ok {
 			wr.Header().Add("Proxy-Authenticate", "Basic")
 			if p.Verbose {
-				p.getLogger().Println("HttpProxy", status, pau, pap)
+				p.getLogger().Println("HttpProxy", http.StatusText(http.StatusProxyAuthRequired), pau, pap)
 			}
-			http.Error(wr, "", status)
+			http.Error(wr, http.StatusText(http.StatusProxyAuthRequired), http.StatusProxyAuthRequired)
 			return
 		}
 	}
