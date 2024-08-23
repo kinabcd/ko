@@ -22,3 +22,9 @@ type Forwarder interface {
 	// Forward() a conn and someone may Accept() it from Listener
 	Forward(ctx context.Context, c net.Conn) error
 }
+
+type ForwarderFunc func(ctx context.Context, c net.Conn) error
+
+func (f ForwarderFunc) Forward(ctx context.Context, c net.Conn) error {
+	return f(ctx, c)
+}
