@@ -172,6 +172,7 @@ func (p *ProxyServer) serveConnect(wr http.ResponseWriter, req *http.Request) {
 
 		conn, brf, err := rc.Hijack()
 		if err != nil {
+			p.getLogger().Println("HttpProxy hijack failed", err)
 			return
 		}
 		defer conn.Close()
