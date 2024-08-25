@@ -167,15 +167,16 @@ func (p *ProxyServer) serveConnect(wr http.ResponseWriter, req *http.Request) {
 
 	if outConn, err := dialer.DialContext(context.Background(), "tcp", req.URL.Host); err == nil {
 		defer outConn.Close()
-		wr.WriteHeader(http.StatusOK)
 		rc := http.NewResponseController(wr)
 
 		conn, brf, err := rc.Hijack()
 		if err != nil {
+			wr.WriteHeader(http.StatusInternalServerError)
 			p.getLogger().Println("HttpProxy hijack failed", err)
 			return
 		}
 		defer conn.Close()
+		(&http.Response{StatusCode: 200, ProtoMajor: req.ProtoMajor, ProtoMinor: req.ProtoMinor}).Write(conn)
 		koIo.BidirectionalCopy(&koNet.PrefixConn{Prefix: brf.Reader, Conn: conn}, outConn)
 	} else {
 		wr.WriteHeader(http.StatusNotFound)
