@@ -104,15 +104,20 @@ func (srv *ProxyServer) getLogger() *log.Logger {
 }
 
 func (p *ProxyServer) serveOthers(wr http.ResponseWriter, req *http.Request) {
-	if p.Verbose {
-		p.getLogger().Println("HttpProxy", req.Method, req.URL)
+	if req.URL.Scheme == "" {
+		req.URL.Scheme = "http"
 	}
-
+	if req.URL.Host == "" {
+		req.URL.Host = req.Host
+	}
 	if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
 		msg := "unsupported protocal scheme " + req.URL.Scheme
 		http.Error(wr, msg, http.StatusBadRequest)
 		p.getLogger().Println("HttpProxy", msg)
 		return
+	}
+	if p.Verbose {
+		p.getLogger().Println("HttpProxy", req.Proto, req.Method, req.URL)
 	}
 
 	client := &http.Client{}
@@ -151,9 +156,9 @@ func (p *ProxyServer) serveOthers(wr http.ResponseWriter, req *http.Request) {
 func (p *ProxyServer) serveConnect(wr http.ResponseWriter, req *http.Request) {
 	defer req.Body.Close()
 	if p.Verbose {
-		p.getLogger().Println("HttpProxy", req.Method, req.URL.Host)
+		p.getLogger().Println("HttpProxy", req.Proto, req.Method, req.RequestURI)
 	}
-	if hostname, port, err := net.SplitHostPort(req.URL.Host); err != nil || hostname == "" {
+	if hostname, port, err := net.SplitHostPort(req.RequestURI); err != nil || hostname == "" {
 		wr.WriteHeader(http.StatusBadRequest)
 		return
 	} else if portInt, err := strconv.ParseInt(port, 10, 64); err != nil || portInt > 65535 || portInt < 1 {
@@ -165,10 +170,20 @@ func (p *ProxyServer) serveConnect(wr http.ResponseWriter, req *http.Request) {
 		dialer = &net.Dialer{}
 	}
 
-	if outConn, err := dialer.DialContext(context.Background(), "tcp", req.URL.Host); err == nil {
+	if outConn, err := dialer.DialContext(context.Background(), "tcp", req.RequestURI); err == nil {
 		defer outConn.Close()
 		rc := http.NewResponseController(wr)
-
+		if req.ProtoMajor >= 2 {
+			wr.WriteHeader(200)
+			rc.Flush()
+			go func() {
+				io.Copy(outConn, req.Body)
+				outConn.Close()
+				req.Body.Close()
+			}()
+			io.Copy(&flushWriter{wr, rc}, outConn)
+			return
+		}
 		conn, brf, err := rc.Hijack()
 		if err != nil {
 			wr.WriteHeader(http.StatusInternalServerError)
@@ -180,6 +195,19 @@ func (p *ProxyServer) serveConnect(wr http.ResponseWriter, req *http.Request) {
 		koIo.BidirectionalCopy(&koNet.PrefixConn{Prefix: brf.Reader, Conn: conn}, outConn)
 	} else {
 		wr.WriteHeader(http.StatusNotFound)
-		p.getLogger().Printf("HttpProxy dial failed %v", err)
+		p.getLogger().Printf("HttpProxy dial failed %v\n", err)
 	}
+}
+
+type flushWriter struct {
+	io.Writer
+	*http.ResponseController
+}
+
+func (f *flushWriter) Write(p []byte) (n int, err error) {
+	n, err = f.Writer.Write(p)
+	if err == nil {
+		err = f.ResponseController.Flush()
+	}
+	return
 }

@@ -63,7 +63,8 @@ func (record *echoHttpDialer) DialContext(ctx context.Context, network, address 
 }
 func TestProxyServer(t *testing.T) {
 	server := &koHttp.ProxyServer{
-		Dialer: &echoHttpDialer{},
+		Dialer:  &echoHttpDialer{},
+		Verbose: true,
 	}
 	lp := koNet.ListenPipe()
 	go server.Serve(lp)
@@ -77,7 +78,7 @@ func TestProxyServer(t *testing.T) {
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		},
 	}
-	res, _ := client.Get("http://example.tw:9999/")
+	res, _ := client.Get("http://example.tw:9999/aaa/bbb?A=r#123")
 	body, _ := io.ReadAll(res.Body)
 	koTesting.AssertEquals(t, "example.tw:9999", string(body))
 	res, _ = client.Get("https://example.tw/")
@@ -91,6 +92,7 @@ func TestProxyServerPassword(t *testing.T) {
 		AuthHandler: func(username, password string) bool {
 			return username == "123" && password == "456"
 		},
+		Verbose: true,
 	}
 	lp := koNet.ListenPipe()
 	go server.Serve(lp)
