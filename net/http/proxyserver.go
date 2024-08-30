@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -40,14 +41,25 @@ func delHopHeaders(header http.Header) {
 	}
 }
 
+func getXForwardedFor(header http.Header) []string {
+	if prior, ok := header["X-Forwarded-For"]; ok {
+		hostsStr := strings.Join(prior, ",")
+		hosts := strings.Split(hostsStr, ",")
+		for i, host := range hosts {
+			hosts[i] = strings.Trim(host, " ")
+		}
+		return hosts
+	}
+	return []string{}
+}
+
 func appendHostToXForwardHeader(header http.Header, host string) {
 	// If we aren't the first proxy retain prior
 	// X-Forwarded-For information as a comma+space
 	// separated list and fold multiple headers into one.
-	if prior, ok := header["X-Forwarded-For"]; ok {
-		host = strings.Join(prior, ", ") + ", " + host
-	}
-	header.Set("X-Forwarded-For", host)
+	hosts := getXForwardedFor(header)
+	hosts = append(hosts, host)
+	header.Set("X-Forwarded-For", strings.Join(hosts, ", "))
 }
 
 // A Server defines parameters for running an HTTP PROXY server.
@@ -66,6 +78,13 @@ type ProxyServer struct {
 
 	// handle authorization. AuthMethodNotRequired if nil
 	AuthHandler func(username, password string) bool
+
+	// Call fallback if the request is not proxy request
+	Fallback http.Handler
+
+	// Do not proxy these domain.
+	// The request will be forward to Fallback
+	ExcludeHosts []string
 }
 
 func (p *ProxyServer) Serve(l net.Listener) error {
@@ -74,6 +93,14 @@ func (p *ProxyServer) Serve(l net.Listener) error {
 }
 
 func (p *ProxyServer) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
+	if !p.isAllowedProxyRequest(req) {
+		if p.Fallback != nil {
+			p.Fallback.ServeHTTP(wr, req)
+		} else {
+			wr.WriteHeader(http.StatusForbidden)
+		}
+		return
+	}
 	if p.AuthHandler != nil {
 		pa := req.Header.Get("Proxy-Authorization")
 		pau, pap, ok := DecodeBasicAuth(pa)
@@ -93,6 +120,50 @@ func (p *ProxyServer) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 	} else {
 		p.serveOthers(wr, req)
 	}
+}
+
+func (p *ProxyServer) isAllowedProxyRequest(req *http.Request) bool {
+	var hostport string
+	if req.Method == http.MethodConnect {
+		hostport = req.RequestURI
+	} else {
+		if req.ProtoMajor == 1 && req.URL.Host == "" {
+			// For HTTP/1.*, req.URL.Host must be target host if it is proxy request.
+			return false
+		} else if req.ProtoMajor == 2 {
+			// For HTTP/2, req.URL.Host is always empty. https://github.com/golang/go/issues/68365
+			// We can't tell whether it is a Proxy request just from http.Request
+		}
+		var isHttps bool
+		if req.ProtoMajor == 1 {
+			isHttps = req.URL.Scheme == "https"
+		} else if req.ProtoMajor == 2 {
+			isHttps = req.TLS != nil // nil if not scheme https. https://cs.opensource.google/go/x/net/+/refs/tags/v0.28.0:http2/server.go;l=2250
+		}
+
+		// Host must have a port if it is not http on 80 or https on 443.
+		if _, _, err := net.SplitHostPort(req.Host); err == nil {
+			hostport = req.Host
+		} else if isHttps {
+			hostport = req.Host + ":443"
+		} else {
+			hostport = req.Host + ":80"
+		}
+	}
+
+	if slices.Contains(p.ExcludeHosts, hostport) {
+		return false
+	} else if hostname, _, err := net.SplitHostPort(hostport); err == nil && slices.Contains(p.ExcludeHosts, hostname) {
+		return false
+	}
+
+	if clientIP, _, err := net.SplitHostPort(req.RemoteAddr); err == nil {
+		// Request loop.
+		if hosts := getXForwardedFor(req.Header); len(hosts) > 0 && hosts[len(hosts)-1] == clientIP {
+			return false
+		}
+	}
+	return true
 }
 
 func (srv *ProxyServer) getLogger() *log.Logger {
