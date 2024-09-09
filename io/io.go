@@ -1,6 +1,8 @@
 package io
 
-import "io"
+import (
+	"io"
+)
 
 // Bind establishes a bidirectional data transfer between two connections.
 // Two connections will be closed if anyone is closed.
@@ -78,4 +80,13 @@ func ReadCString(r io.Reader) (str string, err error) {
 		}
 	}
 	return string(bs), nil
+}
+
+// WriteCString writes bytes to Writer and append a '\0'.
+func WriteCString(w io.Writer, str string) (err error) {
+	if _, err = w.Write([]byte(str)); err != nil {
+		return
+	}
+	_, err = w.Write([]byte{0})
+	return
 }
