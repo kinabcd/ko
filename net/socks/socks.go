@@ -6,6 +6,7 @@ import (
 
 var ErrWrongProtocol error = fmt.Errorf("wrong protocol")
 var ErrAuthFailed error = fmt.Errorf("auth failed")
+var ErrAuthMethodNotSupported error = fmt.Errorf("auth method not supported")
 var ErrCmdNotSupported error = fmt.Errorf("cmd not supported")
 var ErrWrongFormat error = fmt.Errorf("wrong format")
 var ErrBadRequest error = fmt.Errorf("bad request")

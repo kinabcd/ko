@@ -92,7 +92,11 @@ func readSOCKS5Request(conn net.Conn) (address string, err error) {
 		err = ErrCmdNotSupported
 		return
 	}
+	return readSOCKS5Addr(conn, addressType)
+}
 
+func readSOCKS5Addr(conn net.Conn, addressType byte) (address string, err error) {
+	var bs []byte
 	var host string
 	if addressType == AddrTypeIPv4 {
 		bs, err = koIo.ReadN(conn, 4)

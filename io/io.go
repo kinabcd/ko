@@ -1,6 +1,7 @@
 package io
 
 import (
+	"errors"
 	"io"
 )
 
@@ -55,6 +56,19 @@ func ReadPascalString(r io.Reader) (str string, err error) {
 	} else {
 		str = string(bs)
 	}
+	return
+}
+
+func WritePascalString(w io.Writer, str string) (err error) {
+	size := len(str)
+	if size >= 256 {
+		return errors.New("length of str is too large")
+	}
+	sizeByte := byte(uint8(size))
+	if _, err = w.Write([]byte{sizeByte}); err != nil {
+		return
+	}
+	_, err = w.Write([]byte(str))
 	return
 }
 
