@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/tls"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -63,8 +64,8 @@ func (record *echoHttpDialer) DialContext(ctx context.Context, network, address 
 }
 func TestProxyServer(t *testing.T) {
 	server := &koHttp.ProxyServer{
-		Dialer:  &echoHttpDialer{},
-		Verbose: true,
+		Dialer: &echoHttpDialer{},
+		Logger: slog.Default(),
 	}
 	lp := koNet.ListenPipe()
 	go server.Serve(lp)
@@ -92,7 +93,7 @@ func TestProxyServerPassword(t *testing.T) {
 		AuthHandler: func(username, password string) bool {
 			return username == "123" && password == "456"
 		},
-		Verbose: true,
+		Logger: slog.Default(),
 	}
 	lp := koNet.ListenPipe()
 	go server.Serve(lp)

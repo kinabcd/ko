@@ -3,7 +3,7 @@ package socks
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"slices"
 	"time"
@@ -21,11 +21,8 @@ type Server struct {
 	Dialer koNet.ContextDialer
 
 	// Logger specifies an optional logger for errors.
-	// If nil, logging is done via the log package's standard logger.
-	Logger *log.Logger
-
-	// Log non-error messages if Verbose is true.
-	Verbose bool
+	// If nil, log nothing.
+	Logger *slog.Logger
 
 	// Handle authorization. AuthMethodNotRequired if nil
 	// If AuthHandler is not nil, SOCKS4(a) server will not serve.
@@ -33,16 +30,13 @@ type Server struct {
 }
 
 func (srv *Server) Serve(l koNet.Listener) error {
-	if srv.Logger == nil {
-		srv.Logger = log.Default()
-	}
 	defer l.Close()
 	baseCtx := context.Background()
 	for {
 		conn, err := l.Accept()
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				srv.getLogger().Printf("SOCKS: Accept error: %v; retrying in 100ms", err)
+				srv.logW("Accept timeout", "err", err)
 				koTime.SleepContext(baseCtx, 100*time.Millisecond)
 				continue
 			}
@@ -50,7 +44,7 @@ func (srv *Server) Serve(l koNet.Listener) error {
 		}
 		go func() {
 			if srv.ServeSOCKS(conn); err != nil {
-				srv.getLogger().Printf("SOCKS: %v\n", err)
+				srv.logW("handle conn failed", "err", err)
 			}
 		}()
 	}
@@ -64,11 +58,14 @@ func (srv *Server) getDialer() (dialer koNet.ContextDialer) {
 	return
 }
 
-func (srv *Server) getLogger() *log.Logger {
-	if srv.Logger != nil {
-		return srv.Logger
-	} else {
-		return log.Default()
+func (p *Server) logD(msg string, args ...any) {
+	if p.Logger != nil {
+		p.Logger.Debug(msg, args...)
+	}
+}
+func (p *Server) logW(msg string, args ...any) {
+	if p.Logger != nil {
+		p.Logger.Warn(msg, args...)
 	}
 }
 
@@ -93,9 +90,7 @@ func (srv *Server) serveSOCKS4(conn net.Conn) (err error) {
 		err = fmt.Errorf("wrong header: %w", err)
 		return err
 	}
-	if srv.Verbose {
-		srv.getLogger().Println("SOCKS4", address)
-	}
+	srv.logD("Connect", "proto", "SOCKS4", "address", address)
 	if srv.AuthHandler != nil {
 		return ErrAuthFailed
 	}
@@ -148,9 +143,7 @@ func (srv *Server) serveSOCKS5(conn net.Conn) (err error) {
 		return
 	}
 
-	if srv.Verbose {
-		srv.getLogger().Println("SOCKS5", address)
-	}
+	srv.logD("Connect", "proto", "SOCKS5", "address", address)
 	var outConn net.Conn
 	if outConn, err = srv.getDialer().DialContext(context.Background(), "tcp", address); err != nil {
 		writeSOCKS5Response(conn, StatusNetworkUnreachable)

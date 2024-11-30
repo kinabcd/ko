@@ -3,10 +3,9 @@ package http
 import (
 	"context"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
-	"slices"
 	"strconv"
 	"strings"
 
@@ -70,21 +69,20 @@ type ProxyServer struct {
 	Dialer koNet.ContextDialer
 
 	// Logger specifies an optional logger for errors.
-	// If nil, logging is done via the log package's standard logger.
-	Logger *log.Logger
+	// If nil, log nothing
+	Logger *slog.Logger
 
-	// Log non-error messages if Verbose is true.
-	Verbose bool
-
-	// handle authorization. AuthMethodNotRequired if nil
+	// Handle authorization. Return true if identify is allowed.
+	// If AuthHandler is nil, Proxy-Authorization is not required.
 	AuthHandler func(username, password string) bool
+
+	// Handle proxy request.
+	// Return true if proxy request is allowed, or false for forwarding to Fallback
+	// If RequestHandler is nil, all requests are allowed
+	RequestHandler func(host string) bool
 
 	// Call fallback if the request is not proxy request
 	Fallback http.Handler
-
-	// Do not proxy these domain.
-	// The request will be forward to Fallback
-	ExcludeHosts []string
 }
 
 func (p *ProxyServer) Serve(l net.Listener) error {
@@ -107,9 +105,7 @@ func (p *ProxyServer) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 		ok = ok && p.AuthHandler(pau, pap)
 		if !ok {
 			wr.Header().Add("Proxy-Authenticate", "Basic")
-			if p.Verbose {
-				p.getLogger().Println("HttpProxy", http.StatusText(http.StatusProxyAuthRequired), pau, pap)
-			}
+			p.logD("auth failed", slog.String("user", pau), slog.String("pass", pap))
 			http.Error(wr, http.StatusText(http.StatusProxyAuthRequired), http.StatusProxyAuthRequired)
 			return
 		}
@@ -151,9 +147,7 @@ func (p *ProxyServer) isAllowedProxyRequest(req *http.Request) bool {
 		}
 	}
 
-	if slices.Contains(p.ExcludeHosts, hostport) {
-		return false
-	} else if hostname, _, err := net.SplitHostPort(hostport); err == nil && slices.Contains(p.ExcludeHosts, hostname) {
+	if p.RequestHandler != nil && !p.RequestHandler(hostport) {
 		return false
 	}
 
@@ -166,11 +160,14 @@ func (p *ProxyServer) isAllowedProxyRequest(req *http.Request) bool {
 	return true
 }
 
-func (srv *ProxyServer) getLogger() *log.Logger {
-	if srv.Logger != nil {
-		return srv.Logger
-	} else {
-		return log.Default()
+func (p *ProxyServer) logD(msg string, args ...any) {
+	if p.Logger != nil {
+		p.Logger.Debug(msg, args...)
+	}
+}
+func (p *ProxyServer) logW(msg string, args ...any) {
+	if p.Logger != nil {
+		p.Logger.Warn(msg, args...)
 	}
 }
 
@@ -184,12 +181,10 @@ func (p *ProxyServer) serveOthers(wr http.ResponseWriter, req *http.Request) {
 	if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
 		msg := "unsupported protocal scheme " + req.URL.Scheme
 		http.Error(wr, msg, http.StatusBadRequest)
-		p.getLogger().Println("HttpProxy", msg)
+		p.logW(msg)
 		return
 	}
-	if p.Verbose {
-		p.getLogger().Println("HttpProxy", req.Proto, req.Method, req.URL)
-	}
+	p.logD(req.Method, slog.Any("url", req.URL), slog.String("proto", req.Proto))
 
 	client := &http.Client{}
 	if p.Dialer != nil {
@@ -211,7 +206,7 @@ func (p *ProxyServer) serveOthers(wr http.ResponseWriter, req *http.Request) {
 	resp, err := client.Do(req)
 	if err != nil {
 		http.Error(wr, "Server Error", http.StatusInternalServerError)
-		p.getLogger().Println("HttpProxy", err)
+		p.logW(err.Error())
 		return
 	}
 	defer resp.Body.Close()
@@ -226,9 +221,7 @@ func (p *ProxyServer) serveOthers(wr http.ResponseWriter, req *http.Request) {
 
 func (p *ProxyServer) serveConnect(wr http.ResponseWriter, req *http.Request) {
 	defer req.Body.Close()
-	if p.Verbose {
-		p.getLogger().Println("HttpProxy", req.Proto, req.Method, req.RequestURI)
-	}
+	p.logD(req.Method, slog.Any("url", req.RequestURI), slog.String("proto", req.Proto))
 	if hostname, port, err := net.SplitHostPort(req.RequestURI); err != nil || hostname == "" {
 		wr.WriteHeader(http.StatusBadRequest)
 		return
@@ -258,7 +251,7 @@ func (p *ProxyServer) serveConnect(wr http.ResponseWriter, req *http.Request) {
 		conn, brf, err := rc.Hijack()
 		if err != nil {
 			wr.WriteHeader(http.StatusInternalServerError)
-			p.getLogger().Println("HttpProxy hijack failed", err)
+			p.logW("hijack failed", slog.Any("err", err))
 			return
 		}
 		defer conn.Close()
@@ -266,7 +259,7 @@ func (p *ProxyServer) serveConnect(wr http.ResponseWriter, req *http.Request) {
 		koIo.BidirectionalCopy(&koNet.PrefixConn{Prefix: brf.Reader, Conn: conn}, outConn)
 	} else {
 		wr.WriteHeader(http.StatusNotFound)
-		p.getLogger().Printf("HttpProxy dial failed %v\n", err)
+		p.logW("dial failed", slog.Any("err", err))
 	}
 }
 
