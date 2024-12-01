@@ -1,6 +1,7 @@
 package net
 
 import (
+	"errors"
 	"io"
 	"net"
 )
@@ -22,7 +23,7 @@ func (b *PrefixConn) Read(p []byte) (n int, err error) {
 		n, err = b.Prefix.Read(p)
 		if err == nil {
 			return
-		} else if err == io.EOF {
+		} else if errors.Is(err, io.EOF) {
 			b.Prefix = nil
 		}
 	}
@@ -34,9 +35,10 @@ func (b *PrefixConn) WriteTo(w io.Writer) (n int64, err error) {
 	if b.Prefix != nil {
 		nn, err = io.Copy(w, b.Prefix)
 		n += nn
-		if err != nil && err != io.EOF {
+		if err != nil && !errors.Is(err, io.EOF) {
 			return
 		}
+		b.Prefix = nil
 	}
 	nn, err = io.Copy(w, b.Conn)
 	n += nn

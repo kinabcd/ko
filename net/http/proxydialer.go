@@ -59,23 +59,23 @@ func (s *ProxyDialer) DialContext(ctx context.Context, network, addr string) (co
 	}
 
 	if proxyURL.Scheme == "https" {
-		var host string
-		if host, _, err = net.SplitHostPort(proxyURL.Host); err != nil {
-			return
+		tlsConfig := &tls.Config{
+			ServerName:         proxyURL.Hostname(),
+			InsecureSkipVerify: proxyURL.Query().Has("insecure"),
 		}
-		tlsConfig := &tls.Config{}
-		tlsConfig.ServerName = host
-		tlsConfig.InsecureSkipVerify = proxyURL.Query().Has("insecure")
 		conn = tls.Client(conn, tlsConfig)
 	}
 
 	if err = req.Write(conn); err == nil {
 		var resp *http.Response
-		if resp, err = http.ReadResponse(bufio.NewReader(conn), req); err == nil {
+		reader := bufio.NewReader(conn)
+		if resp, err = http.ReadResponse(reader, req); err == nil {
 			if resp.StatusCode == 200 {
-				return
+				return &koNet.PrefixConn{Conn: conn, Prefix: reader}, nil
 			}
 			err = fmt.Errorf("connect server using proxy error, statusCode %d", resp.StatusCode)
+		} else {
+			err = errors.Join(errors.New("read response failed"), err)
 		}
 	}
 	conn.Close()

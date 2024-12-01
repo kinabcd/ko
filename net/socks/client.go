@@ -38,14 +38,10 @@ func (s *Client) DialContext(ctx context.Context, network, addr string) (conn ne
 			return
 		}
 		if s.ProxyUrl.Scheme == "socks5+tls" {
-			var host string
-			if host, _, err = net.SplitHostPort(s.ProxyUrl.Host); err != nil {
-				return
-			}
-			tlsConfig := &tls.Config{}
-			tlsConfig.ServerName = host
-			tlsConfig.InsecureSkipVerify = s.ProxyUrl.Query().Has("insecure")
-			conn = tls.Client(conn, tlsConfig)
+			conn = tls.Client(conn, &tls.Config{
+				ServerName:         s.ProxyUrl.Hostname(),
+				InsecureSkipVerify: s.ProxyUrl.Query().Has("insecure"),
+			})
 		}
 		return SOCKS5Client(ctx, conn, network, addr, s.ProxyUrl.User)
 	}
