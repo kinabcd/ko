@@ -3,9 +3,11 @@ package net
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"math/rand/v2"
 	"net"
+	"net/url"
 	"os"
 	"sync"
 	"time"
@@ -18,6 +20,7 @@ var (
 	_ io.WriterTo   = &mioSubConn{}
 	_ ContextDialer = &mioConn{}
 	_ Listener      = &mioConn{}
+	_ net.Addr      = &subAddr{}
 )
 
 // Multi-connections in one connection. A pipeListener on net.Conn.
@@ -25,7 +28,16 @@ type MioConn interface {
 	ContextDialer
 	Listener
 	Done() <-chan struct{}
+	SubConns() map[uint16]MioSubConn
+	LocalAddr() net.Addr
+	RemoteAddr() net.Addr
 }
+type MioSubConn interface {
+	Id() uint16
+	LocalAddr() net.Addr
+	RemoteAddr() net.Addr
+}
+
 type mioConn struct {
 	// MaxWriteSize, the data payload size, must be between 1 and 65535 bytes.
 	MaxWriteSize int
@@ -46,6 +58,8 @@ type mioConn struct {
 	subConnLock sync.Mutex
 	subIdNext   uint16
 	subConns    map[uint16]*mioSubConn
+
+	version byte
 }
 
 func NewMioConn(c net.Conn) (m *mioConn) {
@@ -74,6 +88,15 @@ func (m *mioConn) Done() <-chan struct{} {
 		<-m.handshakeContext.Done()
 	}
 	return m.ctx.Done()
+}
+func (m *mioConn) SubConns() map[uint16]MioSubConn {
+	r := make(map[uint16]MioSubConn)
+	m.subConnLock.Lock()
+	defer m.subConnLock.Unlock()
+	for subId, conn := range m.subConns {
+		r[subId] = conn
+	}
+	return r
 }
 func (m *mioConn) handshake() (err error) {
 	m.statusLock.Lock()
@@ -115,9 +138,14 @@ func (m *mioConn) handshake() (err error) {
 		}
 	}()
 	// say hello "MIO" (3), Version(1)
-	m.writeAsync([]byte{'M', 'I', 'O', 0})
-	if _, err = koIo.ReadN(c, 4); err != nil {
-		return
+	m.version = 1
+	m.writeAsync([]byte{'M', 'I', 'O', m.version})
+	if bs, err := koIo.ReadN(c, 4); err != nil {
+		return err
+	} else {
+		if m.version > bs[3] {
+			m.version = bs[3]
+		}
 	}
 	for {
 		// high card. winner is main.
@@ -157,7 +185,19 @@ func (m *mioConn) processNextPack() (err error) {
 	if t == 1 { // Dial
 		m.subConnLock.Lock()
 		defer m.subConnLock.Unlock()
-		c := newMioSubConn(m.ctx, id, m)
+		localAddr := m.conn.LocalAddr()
+		if m.version >= 1 {
+			var str string
+			var u *url.URL
+			if str, err = koIo.ReadCString(m.conn); err != nil {
+				return
+			} else if u, err = url.Parse(str); err != nil {
+				return
+			} else {
+				localAddr = &subAddr{network: u.Scheme, address: u.Host}
+			}
+		}
+		c := newMioSubConn(m.ctx, id, m, localAddr, m.conn.RemoteAddr())
 		m.subConns[c.id] = c
 		select {
 		case m.acceptChan <- c:
@@ -216,7 +256,15 @@ func (m *mioConn) nextIdLocked() uint16 {
 }
 
 func (m *mioConn) Addr() net.Addr {
+	return m.LocalAddr()
+}
+
+func (m *mioConn) LocalAddr() net.Addr {
 	return m.conn.LocalAddr()
+}
+
+func (m *mioConn) RemoteAddr() net.Addr {
+	return m.conn.RemoteAddr()
 }
 
 func (m *mioConn) Close() (err error) {
@@ -250,10 +298,10 @@ func (m *mioConn) Accept() (conn net.Conn, e error) {
 	}
 }
 
-func (m *mioConn) newSubConn() *mioSubConn {
+func (m *mioConn) newSubConn(network, addr string) *mioSubConn {
 	m.subConnLock.Lock()
 	defer m.subConnLock.Unlock()
-	c := newMioSubConn(m.ctx, m.nextIdLocked(), m)
+	c := newMioSubConn(m.ctx, m.nextIdLocked(), m, m.conn.LocalAddr(), &subAddr{network: network, address: addr})
 	m.subConns[c.id] = c
 	return c
 }
@@ -266,7 +314,7 @@ func (m *mioConn) DialContext(ctx context.Context, network, addr string) (conn n
 		case <-m.handshakeContext.Done():
 		}
 	}
-	sc := m.newSubConn()
+	sc := m.newSubConn(network, addr)
 	if e = sc.dial(ctx); e != nil {
 		go sc.Close()
 		return nil, e
@@ -301,6 +349,9 @@ type mioSubConn struct {
 	idBytes  []byte
 	mainConn *mioConn
 
+	localAddr  net.Addr
+	remoteAddr net.Addr
+
 	readChan chan []byte
 	readBuf  []byte
 
@@ -315,7 +366,7 @@ type mioSubConn struct {
 	writeDeadline time.Time
 }
 
-func newMioSubConn(ctx context.Context, id uint16, mainConn *mioConn) *mioSubConn {
+func newMioSubConn(ctx context.Context, id uint16, mainConn *mioConn, localAddr, remoteAddr net.Addr) *mioSubConn {
 	idBytes := binary.BigEndian.AppendUint16([]byte{}, id)
 	baseContext, cancelFunc := context.WithCancel(ctx)
 	dialing, dialingDone := context.WithCancel(baseContext)
@@ -323,6 +374,9 @@ func newMioSubConn(ctx context.Context, id uint16, mainConn *mioConn) *mioSubCon
 		id:       id,
 		idBytes:  idBytes,
 		mainConn: mainConn,
+
+		localAddr:  localAddr,
+		remoteAddr: remoteAddr,
 
 		ctx:   baseContext,
 		close: cancelFunc,
@@ -336,7 +390,14 @@ func newMioSubConn(ctx context.Context, id uint16, mainConn *mioConn) *mioSubCon
 }
 
 func (m *mioSubConn) dial(ctx context.Context) (e error) {
-	m.mainConn.writeAsync([]byte{1, m.idBytes[0], m.idBytes[1]})
+	if m.mainConn.version >= 1 {
+		u := url.URL{Scheme: m.remoteAddr.Network(), Host: m.remoteAddr.String()}
+		bs := append([]byte{1, m.idBytes[0], m.idBytes[1]}, []byte(u.String())...)
+		bs = append(bs, 0)
+		m.mainConn.writeAsync(bs)
+	} else {
+		m.mainConn.writeAsync([]byte{1, m.idBytes[0], m.idBytes[1]})
+	}
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -349,6 +410,9 @@ func (m *mioSubConn) accept() (e error) {
 	m.mainConn.writeAsync([]byte{2, m.idBytes[0], m.idBytes[1]})
 	return
 }
+func (m *mioSubConn) Id() uint16 {
+	return m.id
+}
 
 // Close implements net.Conn.
 func (m *mioSubConn) Close() (e error) {
@@ -360,7 +424,10 @@ func (m *mioSubConn) Close() (e error) {
 
 // LocalAddr implements net.Conn.
 func (m *mioSubConn) LocalAddr() net.Addr {
-	return m.mainConn.Addr()
+	if m.localAddr != nil {
+		return m.localAddr
+	}
+	return m.mainConn.LocalAddr()
 }
 
 // Read implements net.Conn.
@@ -453,18 +520,12 @@ func (m *mioSubConn) Write(b []byte) (n int, err error) {
 
 // RemoteAddr implements net.Conn.
 func (m *mioSubConn) RemoteAddr() net.Addr {
-	return m.mainConn.conn.RemoteAddr()
+	return m.remoteAddr
 }
 
 // SetDeadline implements net.Conn.
-func (m *mioSubConn) SetDeadline(t time.Time) (err error) {
-	if err = m.SetReadDeadline(t); err != nil {
-		return
-	}
-	if err = m.SetWriteDeadline(t); err != nil {
-		return
-	}
-	return nil
+func (m *mioSubConn) SetDeadline(t time.Time) error {
+	return errors.Join(m.SetReadDeadline(t), m.SetWriteDeadline(t))
 }
 
 // SetReadDeadline implements net.Conn.
@@ -477,4 +538,17 @@ func (m *mioSubConn) SetReadDeadline(t time.Time) error {
 func (m *mioSubConn) SetWriteDeadline(t time.Time) error {
 	m.writeDeadline = t
 	return nil
+}
+
+type subAddr struct {
+	network string
+	address string
+}
+
+func (a *subAddr) Network() string {
+	return a.network
+}
+
+func (a *subAddr) String() string {
+	return a.address
 }
