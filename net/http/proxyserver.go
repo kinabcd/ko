@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	koIo "github.com/kinabcd/ko/io"
 	koNet "github.com/kinabcd/ko/net"
@@ -83,6 +84,8 @@ type ProxyServer struct {
 
 	// Call fallback if the request is not proxy request
 	Fallback http.Handler
+
+	client *http.Client
 }
 
 func (p *ProxyServer) Serve(l net.Listener) error {
@@ -186,10 +189,17 @@ func (p *ProxyServer) serveOthers(wr http.ResponseWriter, req *http.Request) {
 	}
 	p.logD(req.Method, slog.Any("url", req.URL), slog.String("proto", req.Proto))
 
-	client := &http.Client{}
+	dialContext := koNet.DialContextFunc(nil)
 	if p.Dialer != nil {
-		client.Transport = &http.Transport{
-			DialContext: p.Dialer.DialContext,
+		dialContext = p.Dialer.DialContext
+	}
+	if p.client == nil {
+		p.client = &http.Client{
+			Transport: &http.Transport{
+				DialContext:     dialContext,
+				IdleConnTimeout: 5 * time.Minute,
+			},
+			Jar: nil,
 		}
 	}
 
@@ -203,7 +213,7 @@ func (p *ProxyServer) serveOthers(wr http.ResponseWriter, req *http.Request) {
 		appendHostToXForwardHeader(req.Header, clientIP)
 	}
 
-	resp, err := client.Do(req)
+	resp, err := p.client.Do(req)
 	if err != nil {
 		http.Error(wr, "Server Error", http.StatusInternalServerError)
 		p.logW(err.Error())
@@ -216,7 +226,6 @@ func (p *ProxyServer) serveOthers(wr http.ResponseWriter, req *http.Request) {
 	copyHeader(wr.Header(), resp.Header)
 	wr.WriteHeader(resp.StatusCode)
 	io.Copy(wr, resp.Body)
-	client.CloseIdleConnections()
 }
 
 func (p *ProxyServer) serveConnect(wr http.ResponseWriter, req *http.Request) {
@@ -248,6 +257,7 @@ func (p *ProxyServer) serveConnect(wr http.ResponseWriter, req *http.Request) {
 			io.Copy(&flushWriter{wr, rc}, outConn)
 			return
 		}
+		rc.EnableFullDuplex()
 		conn, brf, err := rc.Hijack()
 		if err != nil {
 			wr.WriteHeader(http.StatusInternalServerError)
@@ -255,7 +265,10 @@ func (p *ProxyServer) serveConnect(wr http.ResponseWriter, req *http.Request) {
 			return
 		}
 		defer conn.Close()
-		(&http.Response{StatusCode: 200, ProtoMajor: req.ProtoMajor, ProtoMinor: req.ProtoMinor}).Write(conn)
+		err = (&http.Response{StatusCode: 200, ProtoMajor: req.ProtoMajor, ProtoMinor: req.ProtoMinor}).Write(conn)
+		if err != nil {
+			p.logW("response failed", slog.Any("err", err))
+		}
 		koIo.BidirectionalCopy(&koNet.PrefixConn{Prefix: brf.Reader, Conn: conn}, outConn)
 	} else {
 		wr.WriteHeader(http.StatusNotFound)
