@@ -1,4 +1,4 @@
-package net_test
+package mio_test
 
 import (
 	"context"
@@ -6,7 +6,7 @@ import (
 	"net"
 	"testing"
 
-	koNet "github.com/kinabcd/ko/net"
+	"github.com/kinabcd/ko/net/mio"
 	koSync "github.com/kinabcd/ko/sync"
 	koTesting "github.com/kinabcd/ko/testing"
 )
@@ -18,8 +18,8 @@ func TestHandleNewConn(t *testing.T) {
 	b12 := make([]byte, 6)
 	b21 := make([]byte, 6)
 	b22 := make([]byte, 6)
-	cc1 := koNet.NewMioConn(c1)
-	cc2 := koNet.NewMioConn(c2)
+	cc1 := mio.New(c1)
+	cc2 := mio.New(c2)
 	wg.Go(
 		func() {
 			c11, err1 := cc1.DialContext(context.Background(), "", "")
