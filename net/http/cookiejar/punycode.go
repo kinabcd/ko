@@ -133,12 +133,12 @@ const acePrefix = "xn--"
 // toASCII("bücher.example.com") is "xn--bcher-kva.example.com", and
 // toASCII("golang") is "golang".
 func toASCII(s string) (string, error) {
-	if IsASCII(s) {
+	if isASCII(s) {
 		return s, nil
 	}
 	labels := strings.Split(s, ".")
 	for i, label := range labels {
-		if !IsASCII(label) {
+		if !isASCII(label) {
 			a, err := encode(acePrefix, label)
 			if err != nil {
 				return "", err

@@ -335,7 +335,7 @@ func canonicalHost(host string) (string, error) {
 		return "", err
 	}
 	// We know this is ascii, no need to check.
-	lower, _ := ToLower(encoded)
+	lower, _ := toLower(encoded)
 	return lower, nil
 }
 
@@ -530,7 +530,7 @@ func (j *Jar) domainAndType(host, domain string) (string, bool, error) {
 		return "", false, errMalformedDomain
 	}
 
-	domain, isASCII := ToLower(domain)
+	domain, isASCII := toLower(domain)
 	if !isASCII {
 		// Received non-ASCII domain, e.g. "perché.com" instead of "xn--perch-fsa.com"
 		return "", false, errMalformedDomain

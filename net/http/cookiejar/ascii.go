@@ -5,9 +5,9 @@ import (
 	"unicode"
 )
 
-// IsPrint returns whether s is ASCII and printable according to
+// isPrint returns whether s is ASCII and printable according to
 // https://tools.ietf.org/html/rfc20#section-4.2.
-func IsPrint(s string) bool {
+func isPrint(s string) bool {
 	for i := 0; i < len(s); i++ {
 		if s[i] < ' ' || s[i] > '~' {
 			return false
@@ -17,7 +17,7 @@ func IsPrint(s string) bool {
 }
 
 // Is returns whether s is ASCII.
-func IsASCII(s string) bool {
+func isASCII(s string) bool {
 	for i := 0; i < len(s); i++ {
 		if s[i] > unicode.MaxASCII {
 			return false
@@ -26,9 +26,9 @@ func IsASCII(s string) bool {
 	return true
 }
 
-// ToLower returns the lowercase version of s if s is ASCII and printable.
-func ToLower(s string) (lower string, ok bool) {
-	if !IsPrint(s) {
+// toLower returns the lowercase version of s if s is ASCII and printable.
+func toLower(s string) (lower string, ok bool) {
+	if !isPrint(s) {
 		return "", false
 	}
 	return strings.ToLower(s), true
