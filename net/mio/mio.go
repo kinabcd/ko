@@ -24,6 +24,7 @@ type Conn interface {
 	LocalAddr() net.Addr
 	RemoteAddr() net.Addr
 	KeepAlive(duration time.Duration)
+	Latency() time.Duration
 }
 type SubConn interface {
 	Id() uint16

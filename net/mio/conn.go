@@ -41,6 +41,11 @@ type conn struct {
 	subIdNext   uint16
 	subConns    map[uint16]*subConn
 
+	pingLock sync.Mutex
+	pingNext uint16
+	pings    map[uint16](chan struct{})
+	latency  []time.Duration
+
 	version byte
 }
 
@@ -50,9 +55,10 @@ func New(c net.Conn) (m *conn) {
 	m = &conn{
 		conn:     c,
 		subConns: make(map[uint16]*subConn),
+		pings:    make(map[uint16]chan struct{}),
 
 		acceptChan: make(chan *subConn, 256),
-		writeChan:  make(chan mioDataMessage, 16),
+		writeChan:  make(chan mioDataMessage, 1024),
 
 		ctx:   baseContext,
 		close: cancel,
@@ -153,6 +159,8 @@ func (m *conn) handshake() (err error) {
 				}
 			}
 		}()
+
+		go m.testLatency()
 		return
 	}
 }
@@ -166,21 +174,19 @@ func (m *conn) processNextPack() (err error) {
 		return
 	}
 	id := binary.BigEndian.Uint16(idBytes)
-	if t == 0 { // No-op
+	if t == 0 {
 	} else if t == 1 { // Dial
 		m.subConnLock.Lock()
 		defer m.subConnLock.Unlock()
-		localAddr := m.conn.LocalAddr()
-		if m.version >= 1 {
-			var str string
-			var u *url.URL
-			if str, err = koIo.ReadCString(m.conn); err != nil {
-				return
-			} else if u, err = url.Parse(str); err != nil {
-				return
-			} else {
-				localAddr = &subAddr{network: u.Scheme, address: u.Host}
-			}
+		var localAddr net.Addr
+		var str string
+		var u *url.URL
+		if str, err = koIo.ReadCString(m.conn); err != nil {
+			return
+		} else if u, err = url.Parse(str); err != nil {
+			return
+		} else {
+			localAddr = &subAddr{network: u.Scheme, address: u.Host}
 		}
 		c := newMioSubConn(m.ctx, id, m, localAddr, m.conn.RemoteAddr())
 		m.subConns[c.id] = c
@@ -226,6 +232,21 @@ func (m *conn) processNextPack() (err error) {
 			}
 
 		}
+	} else if t == 5 { // Ping
+		if (m.isMain && id < 0x8000) || (!m.isMain && id >= 0x8000) {
+			// pong from peer. record the time.
+			m.pingLock.Lock()
+			if p, ok := m.pings[id]; ok {
+				select {
+				case p <- struct{}{}:
+				default:
+				}
+			}
+			m.pingLock.Unlock()
+		} else {
+			// ping from peer. pong it.
+			m.writeAsync([]byte{5, idBytes[0], idBytes[1]})
+		}
 	}
 	return nil
 }
@@ -243,6 +264,42 @@ func (m *conn) nextIdLocked() uint16 {
 			return n
 		}
 	}
+}
+
+func (m *conn) Ping() (time.Duration, error) {
+	var n uint16
+	ch := make(chan struct{})
+	m.pingLock.Lock()
+	for {
+		n = m.pingNext
+		m.pingNext += 1
+		if m.isMain {
+			n &= 0x7FFF
+		} else {
+			n |= 0x8000
+		}
+		if _, ok := m.pings[n]; !ok {
+			break
+		}
+	}
+	m.pings[n] = ch
+	m.pingLock.Unlock()
+	ctx, cancel := context.WithTimeout(m.ctx, 15*time.Second)
+	defer cancel()
+	defer func() {
+		m.pingLock.Lock()
+		delete(m.pings, n)
+		m.pingLock.Unlock()
+	}()
+
+	idBytes := binary.BigEndian.AppendUint16([]byte{}, n)
+	startTime := time.Now()
+	m.writeAsync([]byte{5, idBytes[0], idBytes[1]})
+	select {
+	case <-ch:
+	case <-ctx.Done():
+	}
+	return time.Since(startTime), ctx.Err()
 }
 
 func (m *conn) Addr() net.Addr {
@@ -293,8 +350,36 @@ func (m *conn) KeepAlive(duration time.Duration) {
 		<-m.handshakeContext.Done()
 	}
 	for koTime.SleepContext(m.ctx, duration) {
-		m.writeAsync([]byte{0, 0, 0})
+		go m.testLatency()
 	}
+}
+
+func (m *conn) testLatency() {
+	latency, err := m.Ping()
+	if err != nil {
+		return
+	}
+	m.pingLock.Lock()
+	defer m.pingLock.Unlock()
+	m.latency = append(m.latency, latency)
+	if len(m.latency) > 5 {
+		m.latency = m.latency[1:]
+	}
+}
+
+func (m *conn) Latency() time.Duration {
+	m.pingLock.Lock()
+	defer m.pingLock.Unlock()
+	lenLatency := len(m.latency)
+	if lenLatency == 0 {
+		return 0
+	}
+	sumLatency := time.Duration(0)
+	for _, l := range m.latency {
+		sumLatency += l
+	}
+
+	return time.Duration(int64(sumLatency) / int64(lenLatency))
 }
 
 func (m *conn) newSubConn(network, addr string) *subConn {
