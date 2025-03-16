@@ -37,7 +37,7 @@ func encode(prefix, s string) (string, error) {
 	delta, n, bias := int32(0), initialN, initialBias
 	b, remaining := int32(0), int32(0)
 	for _, r := range s {
-		if r < 0x80 {
+		if r < utf8.RuneSelf {
 			b++
 			output = append(output, byte(r))
 		} else {
@@ -133,12 +133,12 @@ const acePrefix = "xn--"
 // toASCII("bücher.example.com") is "xn--bcher-kva.example.com", and
 // toASCII("golang") is "golang".
 func toASCII(s string) (string, error) {
-	if ascii(s) {
+	if IsASCII(s) {
 		return s, nil
 	}
 	labels := strings.Split(s, ".")
 	for i, label := range labels {
-		if !ascii(label) {
+		if !IsASCII(label) {
 			a, err := encode(acePrefix, label)
 			if err != nil {
 				return "", err
@@ -147,13 +147,4 @@ func toASCII(s string) (string, error) {
 		}
 	}
 	return strings.Join(labels, "."), nil
-}
-
-func ascii(s string) bool {
-	for i := 0; i < len(s); i++ {
-		if s[i] >= utf8.RuneSelf {
-			return false
-		}
-	}
-	return true
 }

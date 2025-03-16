@@ -3,24 +3,19 @@
 // license that can be found in the LICENSE file.
 
 // Package cookiejar implements an in-memory RFC 6265-compliant http.CookieJar.
-//
-// This implementation is a fork of net/http/cookiejar which also
-// implements methods for dumping the cookies to persistent
-// storage and retrieving them.
 package cookiejar
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"net/url"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
-
-	"golang.org/x/net/publicsuffix"
 )
 
 // PublicSuffixList provides the public suffix of a domain. For example:
@@ -56,8 +51,9 @@ type Options struct {
 	// PublicSuffixList is the public suffix list that determines whether
 	// an HTTP server can set a cookie for a domain.
 	//
-	// If this is nil, the public suffix list implementation in golang.org/x/net/publicsuffix
-	// is used.
+	// A nil value is valid and may be useful for testing but it is not
+	// secure: it means that the HTTP server for foo.co.uk can set a cookie
+	// for bar.co.uk.
 	PublicSuffixList PublicSuffixList
 
 	// If it is not empty, we will load cookies from file.
@@ -74,36 +70,27 @@ type Jar struct {
 	// entries is a set of entries, keyed by their eTLD+1 and subkeyed by
 	// their name/domain/path.
 	entries map[string]map[string]entry
+
+	// nextSeqNum is the next sequence number assigned to a new cookie
+	// created SetCookies.
+	nextSeqNum uint64
 }
 
-var noOptions Options
-
-// New returns a new cookie jar. A nil *Options is equivalent to a zero
+// New returns a new cookie jar. A nil [*Options] is equivalent to a zero
 // Options.
-//
-// New will return an error if the cookies could not be loaded
-// from the file for any reason than if the file does not exist.
 func New(o *Options) (*Jar, error) {
-	return newAtTime(o, time.Now())
-}
-
-// newAtTime is like New but takes the current time as a parameter.
-func newAtTime(o *Options, now time.Time) (*Jar, error) {
 	jar := &Jar{
 		entries: make(map[string]map[string]entry),
 	}
-	if o == nil {
-		o = &noOptions
-	}
-	if jar.psList = o.PublicSuffixList; jar.psList == nil {
-		jar.psList = publicsuffix.List
-	}
-	if o.Filename != "" {
-		if err := jar.load(o.Filename); err != nil {
-			return nil, fmt.Errorf("cannot load cookies: %w", err)
+	if o != nil {
+		jar.psList = o.PublicSuffixList
+		if o.Filename != "" {
+			if err := jar.load(o.Filename); err != nil {
+				return nil, fmt.Errorf("cannot load cookies: %w", err)
+			}
 		}
 	}
-	jar.deleteExpired(now)
+
 	return jar, nil
 }
 
@@ -111,13 +98,13 @@ func newAtTime(o *Options, now time.Time) (*Jar, error) {
 //
 // This struct type is not used outside of this package per se, but the exported
 // fields are those of RFC 6265.
-// Note that this structure is marshaled to JSON, so backward-compatibility
-// should be preserved.
 type entry struct {
 	Name       string
 	Value      string
+	Quoted     bool
 	Domain     string
 	Path       string
+	SameSite   string
 	Secure     bool
 	HttpOnly   bool
 	Persistent bool
@@ -125,6 +112,11 @@ type entry struct {
 	Expires    time.Time
 	Creation   time.Time
 	LastAccess time.Time
+
+	// seqNum is a sequence number so that Cookies returns cookies in a
+	// deterministic order, even for cookies that have equal Path length and
+	// equal Creation time. This simplifies testing.
+	seqNum uint64
 
 	// Updated records when the cookie was updated.
 	// This is different from creation time because a cookie
@@ -141,12 +133,7 @@ type entry struct {
 
 // id returns the domain;path;name triple of e as an id.
 func (e *entry) id() string {
-	return id(e.Domain, e.Path, e.Name)
-}
-
-// id returns the domain;path;name triple as an id.
-func id(domain, path, name string) string {
-	return fmt.Sprintf("%s;%s;%s", domain, path, name)
+	return fmt.Sprintf("%s;%s;%s", e.Domain, e.Path, e.Name)
 }
 
 // shouldSend determines whether e's cookie qualifies to be included in a
@@ -156,7 +143,9 @@ func (e *entry) shouldSend(https bool, host, path string) bool {
 	return e.domainMatch(host) && e.pathMatch(path) && (https || !e.Secure)
 }
 
-// domainMatch implements "domain-match" of RFC 6265 section 5.1.3.
+// domainMatch checks whether e's Domain allows sending e back to host.
+// It differs from "domain-match" of RFC 6265 section 5.1.3 because we treat
+// a cookie with an IP address in the Domain always as a host cookie.
 func (e *entry) domainMatch(host string) bool {
 	if e.Domain == host {
 		return true
@@ -184,44 +173,7 @@ func hasDotSuffix(s, suffix string) bool {
 	return len(s) > len(suffix) && s[len(s)-len(suffix)-1] == '.' && s[len(s)-len(suffix):] == suffix
 }
 
-type byCanonicalHost struct {
-	byPathLength
-}
-
-func (s byCanonicalHost) Less(i, j int) bool {
-	e0, e1 := &s.byPathLength[i], &s.byPathLength[j]
-	if e0.CanonicalHost != e1.CanonicalHost {
-		return e0.CanonicalHost < e1.CanonicalHost
-	}
-	return s.byPathLength.Less(i, j)
-}
-
-// byPathLength is a []entry sort.Interface that sorts according to RFC 6265
-// section 5.4 point 2: by longest path and then by earliest creation time.
-type byPathLength []entry
-
-func (s byPathLength) Len() int { return len(s) }
-
-func (s byPathLength) Less(i, j int) bool {
-	e0, e1 := &s[i], &s[j]
-	if len(e0.Path) != len(e1.Path) {
-		return len(e0.Path) > len(e1.Path)
-	}
-	if !e0.Creation.Equal(e1.Creation) {
-		return e0.Creation.Before(e1.Creation)
-	}
-	// The following are not strictly necessary
-	// but are useful for providing deterministic
-	// behaviour in tests.
-	if e0.Name != e1.Name {
-		return e0.Name < e1.Name
-	}
-	return e0.Value < e1.Value
-}
-
-func (s byPathLength) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
-
-// Cookies implements the Cookies method of the http.CookieJar interface.
+// Cookies implements the Cookies method of the [http.CookieJar] interface.
 //
 // It returns an empty slice if the URL's scheme is not HTTP or HTTPS.
 func (j *Jar) Cookies(u *url.URL) (cookies []*http.Cookie) {
@@ -253,17 +205,12 @@ func (j *Jar) cookies(u *url.URL, now time.Time) (cookies []*http.Cookie) {
 		path = "/"
 	}
 
+	modified := false
 	var selected []entry
 	for id, e := range submap {
-		if !e.Expires.After(now) {
-			// Save some space by deleting the value when the cookie
-			// expires. We can't delete the cookie itself because then
-			// we wouldn't know that the cookie had expired when
-			// we merge with another cookie jar.
-			if e.Value != "" {
-				e.Value = ""
-				submap[id] = e
-			}
+		if e.Persistent && !e.Expires.After(now) {
+			delete(submap, id)
+			modified = true
 			continue
 		}
 		if !e.shouldSend(https, host, path) {
@@ -272,158 +219,35 @@ func (j *Jar) cookies(u *url.URL, now time.Time) (cookies []*http.Cookie) {
 		e.LastAccess = now
 		submap[id] = e
 		selected = append(selected, e)
+		modified = true
 	}
-
-	sort.Sort(byPathLength(selected))
-	for _, e := range selected {
-		cookies = append(cookies, &http.Cookie{Name: e.Name, Value: e.Value})
-	}
-
-	return cookies
-}
-
-// AllCookies returns all cookies in the jar. The returned cookies will
-// have Domain, Expires, HttpOnly, Name, Secure, Path, and Value filled
-// out. Expired cookies will not be returned. This function does not
-// modify the cookie jar.
-func (j *Jar) AllCookies() (cookies []*http.Cookie) {
-	return j.allCookies(time.Now())
-}
-
-// allCookies is like AllCookies but takes the current time as a parameter.
-func (j *Jar) allCookies(now time.Time) []*http.Cookie {
-	var selected []entry
-	j.mu.Lock()
-	defer j.mu.Unlock()
-	for _, submap := range j.entries {
-		for _, e := range submap {
-			if !e.Expires.After(now) {
-				// Do not return expired cookies.
-				continue
-			}
-			selected = append(selected, e)
-		}
-	}
-
-	sort.Sort(byCanonicalHost{byPathLength(selected)})
-	cookies := make([]*http.Cookie, len(selected))
-	for i, e := range selected {
-		// Note: The returned cookies do not contain sufficient
-		// information to recreate the database.
-		cookies[i] = &http.Cookie{
-			Name:     e.Name,
-			Value:    e.Value,
-			Path:     e.Path,
-			Domain:   e.Domain,
-			Expires:  e.Expires,
-			Secure:   e.Secure,
-			HttpOnly: e.HttpOnly,
-		}
-	}
-
-	return cookies
-}
-
-// RemoveCookie removes the cookie matching the name, domain and path
-// specified by c.
-func (j *Jar) RemoveCookie(c *http.Cookie) {
-	j.mu.Lock()
-	defer j.mu.Unlock()
-	id := id(c.Domain, c.Path, c.Name)
-	key := jarKey(c.Domain, j.psList)
-	if e, ok := j.entries[key][id]; ok {
-		e.Value = ""
-		e.Expires = time.Now().Add(-1 * time.Second)
-		j.entries[key][id] = e
-	}
-}
-
-// merge merges all the given entries into j. More recently changed
-// cookies take precedence over older ones.
-func (j *Jar) merge(entries []entry) {
-	for _, e := range entries {
-		if e.CanonicalHost == "" {
-			continue
-		}
-		key := jarKey(e.CanonicalHost, j.psList)
-		id := e.id()
-		submap := j.entries[key]
-		if submap == nil {
-			j.entries[key] = map[string]entry{
-				id: e,
-			}
-			continue
-		}
-		oldEntry, ok := submap[id]
-		if !ok || e.Updated.After(oldEntry.Updated) {
-			submap[id] = e
-		}
-	}
-}
-
-var expiryRemovalDuration = 24 * time.Hour
-
-// deleteExpired deletes all entries that have expired for long enough
-// that we can actually expect there to be no external copies of it that
-// might resurrect the dead cookie.
-func (j *Jar) deleteExpired(now time.Time) {
-	for tld, submap := range j.entries {
-		for id, e := range submap {
-			if !e.Expires.After(now) && !e.Updated.Add(expiryRemovalDuration).After(now) {
-				delete(submap, id)
-			}
-		}
+	if modified {
 		if len(submap) == 0 {
-			delete(j.entries, tld)
+			delete(j.entries, key)
+		} else {
+			j.entries[key] = submap
 		}
 	}
-}
 
-// RemoveAllHost removes any cookies from the jar that were set for the given host.
-func (j *Jar) RemoveAllHost(host string) {
-	host, err := canonicalHost(host)
-	if err != nil {
-		return
-	}
-	key := jarKey(host, j.psList)
-
-	j.mu.Lock()
-	defer j.mu.Unlock()
-
-	expired := time.Now().Add(-1 * time.Second)
-	submap := j.entries[key]
-	for id, e := range submap {
-		if e.CanonicalHost == host {
-			// Save some space by deleting the value when the cookie
-			// expires. We can't delete the cookie itself because then
-			// we wouldn't know that the cookie had expired when
-			// we merge with another cookie jar.
-			e.Value = ""
-			e.Expires = expired
-			submap[id] = e
+	// sort according to RFC 6265 section 5.4 point 2: by longest
+	// path and then by earliest creation time.
+	slices.SortFunc(selected, func(a, b entry) int {
+		if r := cmp.Compare(b.Path, a.Path); r != 0 {
+			return r
 		}
-	}
-}
-
-// RemoveAll removes all the cookies from the jar.
-func (j *Jar) RemoveAll() {
-	expired := time.Now().Add(-1 * time.Second)
-	j.mu.Lock()
-	defer j.mu.Unlock()
-	for _, submap := range j.entries {
-		for id, e := range submap {
-			// Save some space by deleting the value when the cookie
-			// expires. We can't delete the cookie itself because then
-			// we wouldn't know that the cookie had expired when
-			// we merge with another cookie jar.
-			e.Value = ""
-			e.Expires = expired
-			submap[id] = e
+		if r := a.Creation.Compare(b.Creation); r != 0 {
+			return r
 		}
+		return cmp.Compare(a.seqNum, b.seqNum)
+	})
+	for _, e := range selected {
+		cookies = append(cookies, &http.Cookie{Name: e.Name, Value: e.Value, Quoted: e.Quoted})
 	}
+
+	return cookies
 }
 
-// SetCookies implements the SetCookies method of the http.CookieJar interface.
+// SetCookies implements the SetCookies method of the [http.CookieJar] interface.
 //
 // It does nothing if the URL's scheme is not HTTP or HTTPS.
 func (j *Jar) SetCookies(u *url.URL, cookies []*http.Cookie) {
@@ -436,8 +260,6 @@ func (j *Jar) setCookies(u *url.URL, cookies []*http.Cookie, now time.Time) {
 		return
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
-		// TODO is this really correct? It might be nice to send
-		// cookies to websocket connections, for example.
 		return
 	}
 	host, err := canonicalHost(u.Host)
@@ -451,25 +273,48 @@ func (j *Jar) setCookies(u *url.URL, cookies []*http.Cookie, now time.Time) {
 	defer j.mu.Unlock()
 
 	submap := j.entries[key]
+
+	modified := false
 	for _, cookie := range cookies {
-		e, err := j.newEntry(cookie, now, defPath, host)
+		e, remove, err := j.newEntry(cookie, now, defPath, host)
 		if err != nil {
 			continue
 		}
 		e.CanonicalHost = host
 		id := e.id()
+		if remove {
+			if submap != nil {
+				if _, ok := submap[id]; ok {
+					delete(submap, id)
+					modified = true
+				}
+			}
+			continue
+		}
 		if submap == nil {
 			submap = make(map[string]entry)
-			j.entries[key] = submap
 		}
+
 		if old, ok := submap[id]; ok {
 			e.Creation = old.Creation
+			e.seqNum = old.seqNum
 		} else {
 			e.Creation = now
+			e.seqNum = j.nextSeqNum
+			j.nextSeqNum++
 		}
 		e.Updated = now
 		e.LastAccess = now
 		submap[id] = e
+		modified = true
+	}
+
+	if modified {
+		if len(submap) == 0 {
+			delete(j.entries, key)
+		} else {
+			j.entries[key] = submap
+		}
 	}
 }
 
@@ -477,7 +322,6 @@ func (j *Jar) setCookies(u *url.URL, cookies []*http.Cookie, now time.Time) {
 // host name.
 func canonicalHost(host string) (string, error) {
 	var err error
-	host = strings.ToLower(host)
 	if hasPort(host) {
 		host, _, err = net.SplitHostPort(host)
 		if err != nil {
@@ -486,7 +330,13 @@ func canonicalHost(host string) (string, error) {
 	}
 	// Strip trailing dot from fully qualified domain names.
 	host = strings.TrimSuffix(host, ".")
-	return toASCII(host)
+	encoded, err := toASCII(host)
+	if err != nil {
+		return "", err
+	}
+	// We know this is ascii, no need to check.
+	lower, _ := ToLower(encoded)
+	return lower, nil
 }
 
 // hasPort reports whether host contains a port number. host may be a host
@@ -511,7 +361,7 @@ func jarKey(host string, psl PublicSuffixList) string {
 	var i int
 	if psl == nil {
 		i = strings.LastIndex(host, ".")
-		if i == -1 {
+		if i <= 0 {
 			return host
 		}
 	} else {
@@ -525,6 +375,9 @@ func jarKey(host string, psl PublicSuffixList) string {
 			// Storing cookies under host is a safe stopgap.
 			return host
 		}
+		// Only len(suffix) is used to determine the jar key from
+		// here on, so it is okay if psl.PublicSuffix("www.buggy.psl")
+		// returns "com" as the jar key is generated from host.
 	}
 	prevDot := strings.LastIndex(host[:i-1], ".")
 	return host[prevDot+1:]
@@ -532,10 +385,17 @@ func jarKey(host string, psl PublicSuffixList) string {
 
 // isIP reports whether host is an IP address.
 func isIP(host string) bool {
+	if strings.ContainsAny(host, ":%") {
+		// Probable IPv6 address.
+		// Hostnames can't contain : or %, so this is definitely not a valid host.
+		// Treating it as an IP is the more conservative option, and avoids the risk
+		// of interpreting ::1%.www.example.com as a subdomain of www.example.com.
+		return true
+	}
 	return net.ParseIP(host) != nil
 }
 
-// defaultPath returns the directory part of an URL's path according to
+// defaultPath returns the directory part of a URL's path according to
 // RFC 6265 section 5.1.4.
 func defaultPath(path string) string {
 	if len(path) == 0 || path[0] != '/' {
@@ -549,18 +409,18 @@ func defaultPath(path string) string {
 	return path[:i] // Path is either of form "/abc/xyz" or "/abc/xyz/".
 }
 
-// newEntry creates an entry from a http.Cookie c. now is the current
-// time and is compared to c.Expires to determine deletion of c. defPath
-// and host are the default-path and the canonical host name of the URL
-// c was received from.
+// newEntry creates an entry from an http.Cookie c. now is the current time and
+// is compared to c.Expires to determine deletion of c. defPath and host are the
+// default-path and the canonical host name of the URL c was received from.
 //
-// The returned entry should be removed if its expiry time is in the
-// past. In this case, e may be incomplete, but it will be valid to call
-// e.id (which depends on e's Name, Domain and Path).
+// remove records whether the jar should delete this cookie, as it has already
+// expired with respect to now. In this case, e may be incomplete, but it will
+// be valid to call e.id (which depends on e's Name, Domain and Path).
 //
 // A malformed c.Domain will result in an error.
-func (j *Jar) newEntry(c *http.Cookie, now time.Time, defPath, host string) (e entry, err error) {
+func (j *Jar) newEntry(c *http.Cookie, now time.Time, defPath, host string) (e entry, remove bool, err error) {
 	e.Name = c.Name
+
 	if c.Path == "" || c.Path[0] != '/' {
 		e.Path = defPath
 	} else {
@@ -569,36 +429,48 @@ func (j *Jar) newEntry(c *http.Cookie, now time.Time, defPath, host string) (e e
 
 	e.Domain, e.HostOnly, err = j.domainAndType(host, c.Domain)
 	if err != nil {
-		return e, err
+		return e, false, err
 	}
+
 	// MaxAge takes precedence over Expires.
-	if c.MaxAge != 0 {
-		e.Persistent = true
+	if c.MaxAge < 0 {
+		return e, true, nil
+	} else if c.MaxAge > 0 {
 		e.Expires = now.Add(time.Duration(c.MaxAge) * time.Second)
-		if c.MaxAge < 0 {
-			return e, nil
-		}
-	} else if c.Expires.IsZero() {
-		e.Expires = endOfTime
-	} else {
 		e.Persistent = true
-		e.Expires = c.Expires
-		if !c.Expires.After(now) {
-			return e, nil
+	} else {
+		if c.Expires.IsZero() {
+			e.Expires = endOfTime
+			e.Persistent = false
+		} else {
+			if !c.Expires.After(now) {
+				return e, true, nil
+			}
+			e.Expires = c.Expires
+			e.Persistent = true
 		}
 	}
 
 	e.Value = c.Value
+	e.Quoted = c.Quoted
 	e.Secure = c.Secure
 	e.HttpOnly = c.HttpOnly
 
-	return e, nil
+	switch c.SameSite {
+	case http.SameSiteDefaultMode:
+		e.SameSite = "SameSite"
+	case http.SameSiteStrictMode:
+		e.SameSite = "SameSite=Strict"
+	case http.SameSiteLaxMode:
+		e.SameSite = "SameSite=Lax"
+	}
+
+	return e, false, nil
 }
 
 var (
 	errIllegalDomain   = errors.New("cookiejar: illegal cookie domain attribute")
 	errMalformedDomain = errors.New("cookiejar: malformed cookie domain attribute")
-	errNoHostname      = errors.New("cookiejar: no host name available (IP only)")
 )
 
 // endOfTime is the time when session (non-persistent) cookies expire.
@@ -615,25 +487,54 @@ func (j *Jar) domainAndType(host, domain string) (string, bool, error) {
 	}
 
 	if isIP(host) {
-		// According to RFC 6265 domain-matching includes not being
-		// an IP address.
-		// TODO: This might be relaxed as in common browsers.
-		return "", false, errNoHostname
+		// RFC 6265 is not super clear here, a sensible interpretation
+		// is that cookies with an IP address in the domain-attribute
+		// are allowed.
+
+		// RFC 6265 section 5.2.3 mandates to strip an optional leading
+		// dot in the domain-attribute before processing the cookie.
+		//
+		// Most browsers don't do that for IP addresses, only curl
+		// (version 7.54) and IE (version 11) do not reject a
+		//     Set-Cookie: a=1; domain=.127.0.0.1
+		// This leading dot is optional and serves only as hint for
+		// humans to indicate that a cookie with "domain=.bbc.co.uk"
+		// would be sent to every subdomain of bbc.co.uk.
+		// It just doesn't make sense on IP addresses.
+		// The other processing and validation steps in RFC 6265 just
+		// collapse to:
+		if host != domain {
+			return "", false, errIllegalDomain
+		}
+
+		// According to RFC 6265 such cookies should be treated as
+		// domain cookies.
+		// As there are no subdomains of an IP address the treatment
+		// according to RFC 6265 would be exactly the same as that of
+		// a host-only cookie. Contemporary browsers (and curl) do
+		// allows such cookies but treat them as host-only cookies.
+		// So do we as it just doesn't make sense to label them as
+		// domain cookies when there is no domain; the whole notion of
+		// domain cookies requires a domain name to be well defined.
+		return host, true, nil
 	}
 
 	// From here on: If the cookie is valid, it is a domain cookie (with
 	// the one exception of a public suffix below).
 	// See RFC 6265 section 5.2.3.
-	if domain[0] == '.' {
-		domain = domain[1:]
-	}
+	domain = strings.TrimPrefix(domain, ".")
 
 	if len(domain) == 0 || domain[0] == '.' {
 		// Received either "Domain=." or "Domain=..some.thing",
 		// both are illegal.
 		return "", false, errMalformedDomain
 	}
-	domain = strings.ToLower(domain)
+
+	domain, isASCII := ToLower(domain)
+	if !isASCII {
+		// Received non-ASCII domain, e.g. "perché.com" instead of "xn--perch-fsa.com"
+		return "", false, errMalformedDomain
+	}
 
 	if domain[len(domain)-1] == '.' {
 		// We received stuff like "Domain=www.example.com.".

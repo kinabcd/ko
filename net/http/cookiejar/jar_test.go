@@ -6,19 +6,12 @@ package cookiejar
 
 import (
 	"fmt"
-	"maps"
 	"net/http"
 	"net/url"
-	"os"
-	"path/filepath"
-	"regexp"
 	"slices"
-	"sort"
 	"strings"
 	"testing"
 	"time"
-
-	koT "github.com/kinabcd/ko/testing"
 )
 
 // tNow is the synthetic current time used as now during testing.
@@ -26,6 +19,10 @@ var tNow = time.Date(2013, 1, 1, 12, 0, 0, 0, time.UTC)
 
 // testPSL implements PublicSuffixList with just two rules: "co.uk"
 // and the default rule "*".
+// The implementation has two intentional bugs:
+//
+//	PublicSuffix("www.buggy.psl") == "xy"
+//	PublicSuffix("www2.buggy.psl") == "com"
 type testPSL struct{}
 
 func (testPSL) String() string {
@@ -35,26 +32,18 @@ func (testPSL) PublicSuffix(d string) string {
 	if d == "co.uk" || strings.HasSuffix(d, ".co.uk") {
 		return "co.uk"
 	}
-	return d[strings.LastIndex(d, ".")+1:]
-}
-
-// emptyPSL implements PublicSuffixList with just the default
-// rule "*".
-type emptyPSL struct{}
-
-func (emptyPSL) String() string {
-	return "emptyPSL"
-}
-func (emptyPSL) PublicSuffix(d string) string {
+	if d == "www.buggy.psl" {
+		return "xy"
+	}
+	if d == "www2.buggy.psl" {
+		return "com"
+	}
 	return d[strings.LastIndex(d, ".")+1:]
 }
 
 // newTestJar creates an empty Jar with testPSL as the public suffix list.
-func newTestJar(path string) *Jar {
-	jar, err := New(&Options{
-		PublicSuffixList: testPSL{},
-		Filename:         path,
-	})
+func newTestJar() *Jar {
+	jar, err := New(&Options{PublicSuffixList: testPSL{}})
 	if err != nil {
 		panic(err)
 	}
@@ -146,6 +135,17 @@ var canonicalHostTests = map[string]string{
 	"[2001:4860:0:::68]:8080": "2001:4860:0:::68",
 	"www.bücher.de":           "www.xn--bcher-kva.de",
 	"www.example.com.":        "www.example.com",
+	// TODO: Fix canonicalHost so that all of the following malformed
+	// domain names trigger an error. (This list is not exhaustive, e.g.
+	// malformed internationalized domain names are missing.)
+	".":                       "",
+	"..":                      ".",
+	"...":                     "..",
+	".net":                    ".net",
+	".net.":                   ".net",
+	"a..":                     "a.",
+	"b.a..":                   "b.a.",
+	"weird.stuff...":          "weird.stuff..",
 	"[bad.unmatched.bracket:": "error",
 }
 
@@ -154,7 +154,7 @@ func TestCanonicalHost(t *testing.T) {
 		got, err := canonicalHost(h)
 		if want == "error" {
 			if err == nil {
-				t.Errorf("%q: got nil error, want non-nil", h)
+				t.Errorf("%q: got %q and nil error, want non-nil", h, got)
 			}
 			continue
 		}
@@ -197,6 +197,17 @@ var jarKeyTests = map[string]string{
 	"co.uk":               "co.uk",
 	"uk":                  "uk",
 	"192.168.0.5":         "192.168.0.5",
+	"www.buggy.psl":       "www.buggy.psl",
+	"www2.buggy.psl":      "buggy.psl",
+	// The following are actual outputs of canonicalHost for
+	// malformed inputs to canonicalHost (see above).
+	"":              "",
+	".":             ".",
+	"..":            ".",
+	".net":          ".net",
+	"a.":            "a.",
+	"b.a.":          "a.",
+	"weird.stuff..": ".",
 }
 
 func TestJarKey(t *testing.T) {
@@ -218,6 +229,15 @@ var jarKeyNilPSLTests = map[string]string{
 	"co.uk":               "co.uk",
 	"uk":                  "uk",
 	"192.168.0.5":         "192.168.0.5",
+	// The following are actual outputs of canonicalHost for
+	// malformed inputs to canonicalHost.
+	"":              "",
+	".":             ".",
+	"..":            "..",
+	".net":          ".net",
+	"a.":            "a.",
+	"b.a.":          "a.",
+	"weird.stuff..": "stuff..",
 }
 
 func TestJarKeyNilPSL(t *testing.T) {
@@ -232,6 +252,7 @@ var isIPTests = map[string]bool{
 	"127.0.0.1":            true,
 	"1.2.3.4":              true,
 	"2001:4860:0:2001::68": true,
+	"::1%zone":             true,
 	"example.com":          false,
 	"1.1.1.300":            false,
 	"www.foo.bar.net":      false,
@@ -286,8 +307,8 @@ var domainAndTypeTests = [...]struct {
 	{"foo.sso.example.com", "sso.example.com", "sso.example.com", false, nil},
 	{"bar.co.uk", "bar.co.uk", "bar.co.uk", false, nil},
 	{"foo.bar.co.uk", ".bar.co.uk", "bar.co.uk", false, nil},
-	{"127.0.0.1", "127.0.0.1", "", false, errNoHostname},
-	{"2001:4860:0:2001::68", "2001:4860:0:2001::68", "2001:4860:0:2001::68", false, errNoHostname},
+	{"127.0.0.1", "127.0.0.1", "127.0.0.1", true, nil},
+	{"2001:4860:0:2001::68", "2001:4860:0:2001::68", "2001:4860:0:2001::68", true, nil},
 	{"www.example.com", ".", "", false, errMalformedDomain},
 	{"www.example.com", "..", "", false, errMalformedDomain},
 	{"www.example.com", "other.com", "", false, errIllegalDomain},
@@ -304,11 +325,11 @@ var domainAndTypeTests = [...]struct {
 }
 
 func TestDomainAndType(t *testing.T) {
-	jar := newTestJar("")
+	jar := newTestJar()
 	for _, tc := range domainAndTypeTests {
 		domain, hostOnly, err := jar.domainAndType(tc.host, tc.domain)
 		if err != tc.wantErr {
-			t.Errorf("%q/%q: got %q error, want %q",
+			t.Errorf("%q/%q: got %q error, want %v",
 				tc.host, tc.domain, err, tc.wantErr)
 			continue
 		}
@@ -319,6 +340,96 @@ func TestDomainAndType(t *testing.T) {
 			t.Errorf("%q/%q: got %q/%t want %q/%t",
 				tc.host, tc.domain, domain, hostOnly,
 				tc.wantDomain, tc.wantHostOnly)
+		}
+	}
+}
+
+// expiresIn creates an expires attribute delta seconds from tNow.
+func expiresIn(delta int) string {
+	t := tNow.Add(time.Duration(delta) * time.Second)
+	return "expires=" + t.Format(time.RFC1123)
+}
+
+// mustParseURL parses s to a URL and panics on error.
+func mustParseURL(s string) *url.URL {
+	u, err := url.Parse(s)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		panic(fmt.Sprintf("Unable to parse URL %s.", s))
+	}
+	return u
+}
+
+// jarTest encapsulates the following actions on a jar:
+//  1. Perform SetCookies with fromURL and the cookies from setCookies.
+//     (Done at time tNow + 0 ms.)
+//  2. Check that the entries in the jar matches content.
+//     (Done at time tNow + 1001 ms.)
+//  3. For each query in tests: Check that Cookies with toURL yields the
+//     cookies in want.
+//     (Query n done at tNow + (n+2)*1001 ms.)
+type jarTest struct {
+	description string   // The description of what this test is supposed to test
+	fromURL     string   // The full URL of the request from which Set-Cookie headers where received
+	setCookies  []string // All the cookies received from fromURL
+	content     string   // The whole (non-expired) content of the jar
+	queries     []query  // Queries to test the Jar.Cookies method
+}
+
+// query contains one test of the cookies returned from Jar.Cookies.
+type query struct {
+	toURL string // the URL in the Cookies call
+	want  string // the expected list of cookies (order matters)
+}
+
+// run runs the jarTest.
+func (test jarTest) run(t *testing.T, jar *Jar) {
+	now := tNow
+
+	// Populate jar with cookies.
+	setCookies := make([]*http.Cookie, len(test.setCookies))
+	for i, cs := range test.setCookies {
+		cookies := (&http.Response{Header: http.Header{"Set-Cookie": {cs}}}).Cookies()
+		if len(cookies) != 1 {
+			panic(fmt.Sprintf("Wrong cookie line %q: %#v", cs, cookies))
+		}
+		setCookies[i] = cookies[0]
+	}
+	jar.setCookies(mustParseURL(test.fromURL), setCookies, now)
+	now = now.Add(1001 * time.Millisecond)
+
+	// Serialize non-expired entries in the form "name1=val1 name2=val2".
+	var cs []string
+	for _, submap := range jar.entries {
+		for _, cookie := range submap {
+			if !cookie.Expires.After(now) {
+				continue
+			}
+
+			v := cookie.Value
+			if strings.ContainsAny(v, " ,") || cookie.Quoted {
+				v = `"` + v + `"`
+			}
+			cs = append(cs, cookie.Name+"="+v)
+		}
+	}
+	slices.Sort(cs)
+	got := strings.Join(cs, " ")
+
+	// Make sure jar content matches our expectations.
+	if got != test.content {
+		t.Errorf("Test %q Content\ngot  %q\nwant %q",
+			test.description, got, test.content)
+	}
+
+	// Test different calls to Cookies.
+	for i, query := range test.queries {
+		now = now.Add(1001 * time.Millisecond)
+		var s []string
+		for _, c := range jar.cookies(mustParseURL(query.toURL), now) {
+			s = append(s, c.String())
+		}
+		if got := strings.Join(s, " "); got != query.want {
+			t.Errorf("Test %q #%d\ngot  %q\nwant %q", test.description, i, got, query.want)
 		}
 	}
 }
@@ -434,28 +545,25 @@ var basicsTests = [...]jarTest{
 			{"http://www.host.test/foo/bar", "A=a D=d"},
 		},
 	},
-	// TODO fix this test. It has never actually tested sorting on
-	// creation time because all the cookies are actually created at
-	// the same moment in time.
-	//	{
-	//		"Creation time determines sorting on same length paths.",
-	//		"http://www.host.test/",
-	//		[]string{
-	//			"A=a; path=/foo/bar",
-	//			"X=x; path=/foo/bar",
-	//			"Y=y; path=/foo/bar/baz/qux",
-	//			"B=b; path=/foo/bar/baz/qux",
-	//			"C=c; path=/foo/bar/baz",
-	//			"W=w; path=/foo/bar/baz",
-	//			"Z=z; path=/foo",
-	//			"D=d; path=/foo"},
-	//		"A=a B=b C=c D=d W=w X=x Y=y Z=z",
-	//		[]query{
-	//			{"http://www.host.test/foo/bar/baz/qux", "Y=y B=b C=c W=w A=a X=x Z=z D=d"},
-	//			{"http://www.host.test/foo/bar/baz/", "C=c W=w A=a X=x Z=z D=d"},
-	//			{"http://www.host.test/foo/bar", "A=a X=x Z=z D=d"},
-	//		},
-	//	},
+	{
+		"Creation time determines sorting on same length paths.",
+		"http://www.host.test/",
+		[]string{
+			"A=a; path=/foo/bar",
+			"X=x; path=/foo/bar",
+			"Y=y; path=/foo/bar/baz/qux",
+			"B=b; path=/foo/bar/baz/qux",
+			"C=c; path=/foo/bar/baz",
+			"W=w; path=/foo/bar/baz",
+			"Z=z; path=/foo",
+			"D=d; path=/foo"},
+		"A=a B=b C=c D=d W=w X=x Y=y Z=z",
+		[]query{
+			{"http://www.host.test/foo/bar/baz/qux", "Y=y B=b C=c W=w A=a X=x Z=z D=d"},
+			{"http://www.host.test/foo/bar/baz/", "C=c W=w A=a X=x Z=z D=d"},
+			{"http://www.host.test/foo/bar", "A=a X=x Z=z D=d"},
+		},
+	},
 	{
 		"Sorting of same-name cookies.",
 		"http://www.host.test/",
@@ -492,6 +600,21 @@ var basicsTests = [...]jarTest{
 		[]query{{"http://192.168.0.10", "a=1"}},
 	},
 	{
+		"Domain cookies on IP.",
+		"http://192.168.0.10",
+		[]string{
+			"a=1; domain=192.168.0.10",  // allowed
+			"b=2; domain=172.31.9.9",    // rejected, can't set cookie for other IP
+			"c=3; domain=.192.168.0.10", // rejected like in most browsers
+		},
+		"a=1",
+		[]query{
+			{"http://192.168.0.10", "a=1"},
+			{"http://172.31.9.9", ""},
+			{"http://www.fancy.192.168.0.10", ""},
+		},
+	},
+	{
 		"Port is ignored #1.",
 		"http://www.host.test/",
 		[]string{"a=1"},
@@ -512,11 +635,37 @@ var basicsTests = [...]jarTest{
 			{"http://www.host.test:1234/", "a=1"},
 		},
 	},
+	{
+		"IPv6 zone is not treated as a host.",
+		"https://example.com/",
+		[]string{"a=1"},
+		"a=1",
+		[]query{
+			{"https://[::1%25.example.com]:80/", ""},
+		},
+	},
+	{
+		"Retrieval of cookies with quoted values", // issue #46443
+		"http://www.host.test/",
+		[]string{
+			`cookie-1="quoted"`,
+			`cookie-2="quoted with spaces"`,
+			`cookie-3="quoted,with,commas"`,
+			`cookie-4= ,`,
+		},
+		`cookie-1="quoted" cookie-2="quoted with spaces" cookie-3="quoted,with,commas" cookie-4=" ,"`,
+		[]query{
+			{
+				"http://www.host.test",
+				`cookie-1="quoted" cookie-2="quoted with spaces" cookie-3="quoted,with,commas" cookie-4=" ,"`,
+			},
+		},
+	},
 }
 
 func TestBasics(t *testing.T) {
 	for _, test := range basicsTests {
-		jar := newTestJar("")
+		jar := newTestJar()
 		test.run(t, jar)
 	}
 }
@@ -553,7 +702,7 @@ var updateAndDeleteTests = [...]jarTest{
 		},
 	},
 	{
-		"Clear Secure flag from a http.",
+		"Clear Secure flag from an http.",
 		"http://www.host.test/",
 		[]string{
 			"b=xx",
@@ -664,14 +813,14 @@ var updateAndDeleteTests = [...]jarTest{
 }
 
 func TestUpdateAndDelete(t *testing.T) {
-	jar := newTestJar("")
+	jar := newTestJar()
 	for _, test := range updateAndDeleteTests {
 		test.run(t, jar)
 	}
 }
 
 func TestExpiration(t *testing.T) {
-	jar := newTestJar("")
+	jar := newTestJar()
 	jarTest{
 		"Expiration.",
 		"http://www.host.test",
@@ -711,8 +860,7 @@ var chromiumBasicsTests = [...]jarTest{
 		"http://www.google.com/",
 		[]string{
 			"a=1; domain=.www.google.com.",
-			"b=2; domain=.www.google.com..",
-		},
+			"b=2; domain=.www.google.com.."},
 		"",
 		[]query{
 			{"http://www.google.com", ""},
@@ -725,8 +873,7 @@ var chromiumBasicsTests = [...]jarTest{
 			"a=1; domain=.a.b.c.d.com",
 			"b=2; domain=.b.c.d.com",
 			"c=3; domain=.c.d.com",
-			"d=4; domain=.d.com",
-		},
+			"d=4; domain=.d.com"},
 		"a=1 b=2 c=3 d=4",
 		[]query{
 			{"http://a.b.c.d.com", "a=1 b=2 c=3 d=4"},
@@ -747,8 +894,8 @@ var chromiumBasicsTests = [...]jarTest{
 			"X=cd; domain=.c.d.com"},
 		"X=bcd X=cd a=1 b=2 c=3 d=4",
 		[]query{
-			{"http://b.c.d.com", "X=bcd X=cd b=2 c=3 d=4"},
-			{"http://c.d.com", "X=cd c=3 d=4"},
+			{"http://b.c.d.com", "b=2 c=3 d=4 X=bcd X=cd"},
+			{"http://c.d.com", "c=3 d=4 X=cd"},
 		},
 	},
 	{
@@ -827,9 +974,16 @@ var chromiumBasicsTests = [...]jarTest{
 	{
 		"TestIpAddress #3.",
 		"http://1.2.3.4/foo",
-		[]string{"a=1; domain=1.2.3.4"},
+		[]string{"a=1; domain=1.2.3.3"},
 		"",
 		[]query{{"http://1.2.3.4/foo", ""}},
+	},
+	{
+		"TestIpAddress #4.",
+		"http://1.2.3.4/foo",
+		[]string{"a=1; domain=1.2.3.4"},
+		"a=1",
+		[]query{{"http://1.2.3.4/foo", "a=1"}},
 	},
 	{
 		"TestNonDottedAndTLD #2.",
@@ -899,7 +1053,7 @@ var chromiumBasicsTests = [...]jarTest{
 
 func TestChromiumBasics(t *testing.T) {
 	for _, test := range chromiumBasicsTests {
-		jar := newTestJar("")
+		jar := newTestJar()
 		test.run(t, jar)
 	}
 }
@@ -959,7 +1113,7 @@ var chromiumDomainTests = [...]jarTest{
 }
 
 func TestChromiumDomain(t *testing.T) {
-	jar := newTestJar("")
+	jar := newTestJar()
 	for _, test := range chromiumDomainTests {
 		test.run(t, jar)
 	}
@@ -1027,7 +1181,7 @@ var chromiumDeletionTests = [...]jarTest{
 }
 
 func TestChromiumDeletion(t *testing.T) {
-	jar := newTestJar("")
+	jar := newTestJar()
 	for _, test := range chromiumDeletionTests {
 		test.run(t, jar)
 	}
@@ -1202,866 +1356,22 @@ var domainHandlingTests = [...]jarTest{
 
 func TestDomainHandling(t *testing.T) {
 	for _, test := range domainHandlingTests {
-		jar := newTestJar("")
+		jar := newTestJar()
 		test.run(t, jar)
 	}
 }
 
-type mergeCookie struct {
-	when   time.Time
-	url    string
-	cookie string
-}
-
-func (c mergeCookie) set(jar *Jar) {
-	setCookies(jar, c.url, []string{c.cookie}, c.when)
-}
-
-var mergeTests = []struct {
-	description string
-	setCookies0 []mergeCookie
-	setCookies1 []mergeCookie
-	now         time.Time
-	content     string
-	queries     []query // Queries to test the Jar.Cookies method
-}{{
-	description: "empty jar1",
-	setCookies0: []mergeCookie{
-		{atTime(0), "http://www.host.test", "A=a; max-age=10"},
-	},
-	now:     atTime(1),
-	content: "A=a",
-}, {
-	description: "empty jar0",
-	setCookies1: []mergeCookie{
-		{atTime(0), "http://www.host.test", "A=a; max-age=10"},
-	},
-	now:     atTime(1),
-	content: "A=a",
-}, {
-	description: "simple override (1)",
-	setCookies0: []mergeCookie{
-		{atTime(0), "http://www.host.test", "A=a; max-age=10"},
-	},
-	setCookies1: []mergeCookie{
-		{atTime(1), "http://www.host.test", "A=b; max-age=10"},
-	},
-	now:     atTime(2),
-	content: "A=b",
-}, {
-	description: "simple override (2)",
-	setCookies0: []mergeCookie{
-		{atTime(1), "http://www.host.test", "A=a; max-age=10"},
-	},
-	setCookies1: []mergeCookie{
-		{atTime(0), "http://www.host.test", "A=b; max-age=10"},
-	},
-	now:     atTime(2),
-	content: "A=a",
-}, {
-	description: "expired cookie overrides unexpired cookie",
-	setCookies0: []mergeCookie{
-		{atTime(1), "http://www.host.test", "A=a; max-age=-1"},
-	},
-	setCookies1: []mergeCookie{
-		{atTime(0), "http://www.host.test", "A=b; max-age=10"},
-	},
-	now:     atTime(2),
-	content: "",
-}, {
-	description: "set overrides expires",
-	setCookies0: []mergeCookie{
-		{atTime(1), "http://www.host.test", "A=a; max-age=10"},
-	},
-	setCookies1: []mergeCookie{
-		{atTime(0), "http://www.host.test", "A=b; max-age=-1"},
-	},
-	now:     atTime(2),
-	content: "A=a",
-}, {
-	description: "expiry times preserved",
-	setCookies0: []mergeCookie{
-		{atTime(1), "http://www.host.test", "A=a; " + expiresIn(5)},
-	},
-	setCookies1: []mergeCookie{
-		{atTime(0), "http://www.host.test", "B=b; " + expiresIn(4)},
-	},
-	now:     atTime(2),
-	content: "A=a B=b",
-	queries: []query{
-		{"http://www.host.test", "B=b A=a"},
-		{"http://www.host.test", "A=a"},
-		{"http://www.host.test", ""},
-	},
-}, {
-	description: "prefer receiver when creation times are identical",
-	setCookies0: []mergeCookie{
-		{atTime(0), "http://www.host.test", "A=a; max-age=10"},
-	},
-	setCookies1: []mergeCookie{
-		{atTime(0), "http://www.host.test", "A=b; max-age=10"},
-	},
-	now:     atTime(2),
-	content: "A=a",
-}, {
-	description: "max-age is persistent even when negative",
-	setCookies0: []mergeCookie{
-		{atTime(0), "http://www.host.test", "A=a; max-age=10"},
-	},
-	setCookies1: []mergeCookie{
-		{atTime(1), "http://www.host.test", "A=b; max-age=-1"},
-	},
-	now:     atTime(2),
-	content: "",
-}, {
-	description: "expires is persistent even when in the past",
-	setCookies0: []mergeCookie{
-		{atTime(0), "http://www.host.test", "A=a; " + expiresIn(2)},
-	},
-	setCookies1: []mergeCookie{
-		{atTime(1), "http://www.host.test", "A=b; " + expiresIn(-1)},
-	},
-	now:     atTime(2),
-	content: "",
-}, {
-	description: "many hosts",
-	setCookies0: []mergeCookie{
-		{atTime(1), "http://www.host.test", "A=a0; max-age=10"},
-		{atTime(2), "http://www.host.test/foo/", "A=foo0; max-age=10"},
-		{atTime(1), "http://www.elsewhere", "X=x; max-age=10"},
-	},
-	setCookies1: []mergeCookie{
-		{atTime(1), "http://www.host.test", "A=a1; max-age=10"},
-		{atTime(3), "http://www.host.test", "B=b; max-age=10"},
-		{atTime(1), "http://www.host.test/foo/", "A=foo1; max-age=10"},
-		{atTime(0), "http://www.host.test/foo/", "C=arble; max-age=10"},
-		{atTime(1), "http://nowhere.com", "A=n; max-age=10"},
-	},
-	now:     atTime(2),
-	content: "A=a0 A=foo0 A=n B=b C=arble X=x",
-	queries: []query{
-		{"http://www.host.test/", "A=a0 B=b"},
-		{"http://www.host.test/foo/", "C=arble A=foo0 A=a0 B=b"},
-		{"http://nowhere.com", "A=n"},
-		{"http://www.elsewhere", "X=x"},
-	},
-}}
-
-func TestSaveMerge(t *testing.T) {
-	dir, err := os.MkdirTemp("", "cookiejar-test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(dir)
-	for i, test := range mergeTests {
-		path := filepath.Join(dir, fmt.Sprintf("jar%d", i))
-		jar0 := newTestJar(path)
-		for _, sc := range test.setCookies0 {
-			sc.set(jar0)
+func TestIssue19384(t *testing.T) {
+	cookies := []*http.Cookie{{Name: "name", Value: "value"}}
+	for _, host := range []string{"", ".", "..", "..."} {
+		jar, _ := New(nil)
+		u := &url.URL{Scheme: "http", Host: host, Path: "/"}
+		if got := jar.Cookies(u); len(got) != 0 {
+			t.Errorf("host %q, got %v", host, got)
 		}
-		jar1 := newTestJar(path)
-		for _, sc := range test.setCookies1 {
-			sc.set(jar1)
-		}
-		err := jar1.save(path, test.now)
-		if err != nil {
-			t.Fatalf("Test %q; cannot save first jar: %v", test.description, err)
-		}
-		err = jar0.save(path, test.now)
-		if err != nil {
-			t.Fatalf("Test %q; cannot save: %v", test.description, err)
-		}
-		got := allCookies(jar0, test.now)
-
-		// Make sure jar content matches our expectations.
-		if got != test.content {
-			t.Logf("entries: %#v", jar0.entries)
-			t.Errorf("Test %q Content\ngot  %q\nwant %q",
-				test.description, got, test.content)
-		}
-		testQueries(t, test.queries, test.description, jar0, test.now)
-	}
-}
-
-func TestDeleteExpired(t *testing.T) {
-	expirySeconds := int(expiryRemovalDuration / time.Second)
-	jar := newTestJar("")
-
-	now := tNow
-	setCookies(jar, "http://foo.com", []string{
-		"a=a; " + expiresIn(1),
-		"b=b; " + expiresIn(expirySeconds+3),
-	}, tNow)
-	setCookies(jar, "http://bar.com", []string{
-		"c=c; " + expiresIn(1),
-	}, tNow)
-	// Make sure all the cookies are there to start with.
-	got := allCookies(jar, now)
-	want := "a=a b=b c=c"
-	// Make sure jar content matches our expectations.
-	if got != want {
-		t.Errorf("Unexpected content\ngot  %q\nwant %q", got, want)
-	}
-
-	now = now.Add(expiryRemovalDuration - time.Millisecond)
-	// Ensure that they've timed out but their entries
-	// are still around before the cutoff period.
-	jar.deleteExpired(now)
-	got = allCookiesIncludingExpired(jar, now)
-	want = "a= b=b c="
-	if got != want {
-		t.Errorf("Unexpected content\ngot  %q\nwant %q", got, want)
-	}
-
-	// Try just after the expiry duration. The entries should really have
-	// been removed now.
-	now = now.Add(2 * time.Millisecond)
-	jar.deleteExpired(now)
-	got = allCookiesIncludingExpired(jar, now)
-	want = "b=b"
-	if got != want {
-		t.Errorf("Unexpected content\ngot  %q\nwant %q", got, want)
-	}
-}
-
-var serializeTestCookies = []*http.Cookie{{
-	Name:       "foo",
-	Value:      "bar",
-	Path:       "/p",
-	Domain:     "example.com",
-	Expires:    time.Now(),
-	RawExpires: time.Now().Format(time.RFC3339Nano),
-	MaxAge:     99,
-	Secure:     true,
-	HttpOnly:   true,
-	Raw:        "raw string",
-	Unparsed:   []string{"x", "y", "z"},
-}}
-
-var serializeTestURL, _ = url.Parse("http://example.com/x")
-
-func jarEntriesEquals(j1, j2 map[string]map[string]entry) bool {
-	return maps.EqualFunc(j1, j2, func(m1, m2 map[string]entry) bool { return maps.EqualFunc(m1, m2, entryEquals) })
-}
-
-func entryEquals(e1, e2 entry) bool {
-	valuesExcludeTime := func(e entry) []any {
-		return []any{e.Name, e.Value, e.Domain, e.Path, e.Secure, e.HttpOnly, e.Persistent, e.HostOnly, e.CanonicalHost}
-	}
-	valuesTime := func(e entry) []time.Time {
-		return []time.Time{e.Expires, e.Creation, e.LastAccess, e.Updated}
-	}
-	if !slices.Equal(valuesExcludeTime(e1), valuesExcludeTime(e2)) {
-		return false
-	}
-	return slices.EqualFunc(valuesTime(e1), valuesTime(e2), func(t1, t2 time.Time) bool { return t1.Equal(t2) })
-
-}
-
-func TestLoadSave(t *testing.T) {
-	d, err1 := os.MkdirTemp("", "")
-	koT.AssertNoError(t, err1)
-	defer os.RemoveAll(d)
-	file := filepath.Join(d, "cookies")
-	j := newTestJar(file)
-	j.SetCookies(serializeTestURL, serializeTestCookies)
-	koT.AssertNoError(t, j.SaveTo(file))
-	_, err2 := os.Stat(file)
-	koT.AssertNoError(t, err2)
-	j1 := newTestJar(file)
-	koT.Assert(t, len(j1.entries) == len(serializeTestCookies), "%d != %d", len(j1.entries), len(serializeTestCookies))
-	koT.Assert(t, jarEntriesEquals(j1.entries, j.entries), "%v and %v not equals", j1.entries, j.entries)
-}
-
-func TestMarshalJSON(t *testing.T) {
-	j := newTestJar("")
-	j.SetCookies(serializeTestURL, serializeTestCookies)
-	// Marshal the cookies.
-	data, err1 := j.MarshalJSON()
-	koT.AssertNoError(t, err1)
-	// Save them to disk.
-	d, err2 := os.MkdirTemp("", "")
-	koT.AssertNoError(t, err2)
-	defer os.RemoveAll(d)
-	file := filepath.Join(d, "cookies")
-	koT.AssertNoError(t, os.WriteFile(file, data, 0600))
-	// Load cookies from the file.
-	j1 := newTestJar(file)
-	koT.Assert(t, len(j1.entries) == len(serializeTestCookies), "%d != %d", len(j1.entries), len(serializeTestCookies))
-	koT.Assert(t, jarEntriesEquals(j1.entries, j.entries), "%v and %v not equals", j1.entries, j.entries)
-}
-
-func TestLoadNonExistentParent(t *testing.T) {
-	d, err := os.MkdirTemp("", "")
-	if err != nil {
-		t.Fatalf("cannot make temp dir: %v", err)
-	}
-	defer os.RemoveAll(d)
-	file := filepath.Join(d, "foo", "cookies")
-	_, err = New(&Options{
-		PublicSuffixList: testPSL{},
-		Filename:         file,
-	})
-	if err != nil {
-		t.Fatalf("cannot make cookie jar: %v", err)
-	}
-}
-
-func TestLoadNonExistentParentOfParent(t *testing.T) {
-	d, err := os.MkdirTemp("", "")
-	if err != nil {
-		t.Fatalf("cannot make temp dir: %v", err)
-	}
-	defer os.RemoveAll(d)
-	file := filepath.Join(d, "foo", "foo", "cookies")
-	_, err = New(&Options{
-		PublicSuffixList: testPSL{},
-		Filename:         file,
-	})
-	if err != nil {
-		t.Fatalf("cannot make cookie jar: %v", err)
-	}
-}
-
-func TestLoadOldFormat(t *testing.T) {
-	// Check that loading the old format (a JSON object)
-	// doesn't result in an error.
-	f, err := os.CreateTemp("", "cookiejar-test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.Remove(f.Name())
-	defer f.Close()
-	_, err = f.Write([]byte("{}"))
-	koT.AssertNoError(t, err)
-	jar, err := New(&Options{
-		Filename: f.Name(),
-	})
-	if err != nil {
-		t.Errorf("got error: %v", err)
-	}
-	if jar == nil {
-		t.Errorf("nil jar")
-	}
-}
-
-func TestLoadInvalidJSON(t *testing.T) {
-	f, err := os.CreateTemp("", "cookiejar-test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.Remove(f.Name())
-	defer f.Close()
-	_, err = f.Write([]byte("["))
-	koT.AssertNoError(t, err)
-	jar, err := New(&Options{
-		Filename: f.Name(),
-	})
-	if err == nil {
-		t.Fatalf("expected error, got none")
-	}
-	want := "cannot load cookies: unexpected EOF"
-	if ok, _ := regexp.MatchString(want, err.Error()); !ok {
-		t.Fatalf("unexpected error message; want %q got %q", want, err.Error())
-	}
-	if jar != nil {
-		t.Fatalf("got nil jar")
-	}
-}
-
-func TestLoadDifferentPublicSuffixList(t *testing.T) {
-	f, err := os.CreateTemp("", "cookiejar-test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	f.Close()
-	defer os.Remove(f.Name())
-	now := tNow
-	// With no public suffix list, some domains that should be
-	// separate can set cookies for each other.
-	jar, err := newAtTime(&Options{
-		Filename:         f.Name(),
-		PublicSuffixList: emptyPSL{},
-	}, now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	setCookies(jar, "http://foo.co.uk", []string{
-		"a=a; max-age=10; domain=.co.uk",
-	}, now)
-	setCookies(jar, "http://bar.co.uk", []string{
-		"b=b; max-age=10; domain=.co.uk",
-	}, now)
-
-	// With the default public suffix, the cookies are
-	// correctly segmented into their proper domains.
-	queries := []query{
-		{"http://foo.co.uk/", "a=a b=b"},
-		{"http://bar.co.uk/", "a=a b=b"},
-	}
-	testQueries(t, queries, "no public suffix list", jar, now)
-	if err := jar.save(f.Name(), now); err != nil {
-		t.Fatalf("cannot save jar: %v", err)
-	}
-
-	jar, err = newAtTime(&Options{
-		Filename:         f.Name(),
-		PublicSuffixList: testPSL{},
-	}, now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	queries = []query{
-		{"http://foo.co.uk/", "a=a"},
-		{"http://bar.co.uk/", "b=b"},
-	}
-	testQueries(t, queries, "with test public suffix list", jar, now)
-	if err := jar.save(f.Name(), now); err != nil {
-		t.Fatalf("cannot save jar: %v", err)
-	}
-
-	// When we reload with the original (empty) public suffix
-	// we get all the original cookies back.
-	jar, err = newAtTime(&Options{
-		Filename:         f.Name(),
-		PublicSuffixList: emptyPSL{},
-	}, now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	queries = []query{
-		{"http://foo.co.uk/", "a=a b=b"},
-		{"http://bar.co.uk/", "a=a b=b"},
-	}
-	testQueries(t, queries, "no public suffix list #2", jar, now)
-	if err := jar.save(f.Name(), now); err != nil {
-		t.Fatalf("cannot save jar: %v", err)
-	}
-}
-
-// jarTest encapsulates the following actions on a jar:
-//  1. Perform SetCookies with fromURL and the cookies from setCookies.
-//     (Done at time tNow + 0 ms.)
-//  2. Check that the entries in the jar matches content.
-//     (Done at time tNow + 1001 ms.)
-//  3. For each query in tests: Check that Cookies with toURL yields the
-//     cookies in want.
-//     (Query n done at tNow + (n+2)*1001 ms.)
-type jarTest struct {
-	description string   // The description of what this test is supposed to test
-	fromURL     string   // The full URL of the request from which Set-Cookie headers where received
-	setCookies  []string // All the cookies received from fromURL
-	content     string   // The whole (non-expired) content of the jar
-	queries     []query  // Queries to test the Jar.Cookies method
-}
-
-// query contains one test of the cookies returned from Jar.Cookies.
-type query struct {
-	toURL string // the URL in the Cookies call
-	want  string // the expected list of cookies (order matters)
-}
-
-// run runs the jarTest.
-func (test jarTest) run(t *testing.T, jar *Jar) {
-	now := tNow
-
-	// Populate jar with cookies.
-	setCookies(jar, test.fromURL, test.setCookies, now)
-	now = now.Add(1001 * time.Millisecond)
-
-	got := allCookies(jar, now)
-
-	// Make sure jar content matches our expectations.
-	if got != test.content {
-		t.Errorf("Test %q Content\ngot  %q\nwant %q",
-			test.description, got, test.content)
-	}
-
-	testQueries(t, test.queries, test.description, jar, now)
-}
-
-// setCookies sets the given cookies in the given jar associated
-// with the given URL at the given time.
-func setCookies(jar *Jar, fromURL string, cookies []string, now time.Time) {
-	setCookies := make([]*http.Cookie, len(cookies))
-	for i, cs := range cookies {
-		cookies := (&http.Response{Header: http.Header{"Set-Cookie": {cs}}}).Cookies()
-		if len(cookies) != 1 {
-			panic(fmt.Sprintf("Wrong cookie line %q: %#v", cs, cookies))
-		}
-		setCookies[i] = cookies[0]
-	}
-	jar.setCookies(mustParseURL(fromURL), setCookies, now)
-}
-
-// allCookies returns all unexpired cookies in the jar
-// in the form "name1=val1 name2=val2"
-// (entries sorted by string).
-func allCookies(jar *Jar, now time.Time) string {
-	var cs []string
-	for _, submap := range jar.entries {
-		for _, cookie := range submap {
-			if !cookie.Expires.After(now) {
-				continue
-			}
-			cs = append(cs, cookie.Name+"="+cookie.Value)
+		jar.SetCookies(u, cookies)
+		if got := jar.Cookies(u); len(got) != 1 || got[0].Value != "value" {
+			t.Errorf("host %q, got %v", host, got)
 		}
 	}
-	sort.Strings(cs)
-	return strings.Join(cs, " ")
-}
-
-// allCookiesIncludingExpired returns all cookies in the jar
-// in the form "name1=val1 name2=val2"
-// (entries sorted by string), including cookies that
-// have expired (without their values)
-func allCookiesIncludingExpired(jar *Jar, now time.Time) string {
-	var cs []string
-	for _, submap := range jar.entries {
-		for _, cookie := range submap {
-			if !cookie.Expires.After(now) {
-				cs = append(cs, cookie.Name+"=")
-			} else {
-				cs = append(cs, cookie.Name+"="+cookie.Value)
-			}
-		}
-	}
-	sort.Strings(cs)
-	return strings.Join(cs, " ")
-}
-
-func testQueries(t *testing.T, queries []query, description string, jar *Jar, now time.Time) {
-	// Test different calls to Cookies.
-	for i, query := range queries {
-		now = now.Add(1001 * time.Millisecond)
-		if got := queryJar(jar, query.toURL, now); got != query.want {
-			t.Errorf("Test %q #%d\ngot  %q\nwant %q", description, i, got, query.want)
-		}
-	}
-}
-
-// queryJar returns the results of querying jar for
-// cookies associated with url at the given time,
-// in "name1=val1 name2=val2" form.
-func queryJar(jar *Jar, toURL string, now time.Time) string {
-	var s []string
-	for _, c := range jar.cookies(mustParseURL(toURL), now) {
-		s = append(s, c.Name+"="+c.Value)
-	}
-	return strings.Join(s, " ")
-}
-
-// expiresIn creates an expires attribute delta seconds from tNow.
-func expiresIn(delta int) string {
-	return "expires=" + atTime(delta).Format(time.RFC1123)
-}
-
-// atTime returns a time delta seconds from tNow.
-func atTime(delta int) time.Time {
-	return tNow.Add(time.Duration(delta) * time.Second)
-}
-
-// mustParseURL parses s to an URL and panics on error.
-func mustParseURL(s string) *url.URL {
-	u, err := url.Parse(s)
-	if err != nil || u.Scheme == "" || u.Host == "" {
-		panic(fmt.Sprintf("Unable to parse URL %s.", s))
-	}
-	return u
-}
-
-type setCommand struct {
-	url     *url.URL
-	cookies []*http.Cookie
-}
-
-var allCookiesTests = []struct {
-	about         string
-	set           []setCommand
-	expectCookies []*http.Cookie
-}{{
-	about: "no cookies",
-}, {
-	about: "a cookie",
-	set: []setCommand{{
-		url: mustParseURL("https://www.google.com/"),
-		cookies: []*http.Cookie{
-			{
-				Name:    "test-cookie",
-				Value:   "test-value",
-				Expires: tNow.Add(24 * time.Hour),
-			},
-		},
-	}},
-	expectCookies: []*http.Cookie{
-		{
-			Name:     "test-cookie",
-			Value:    "test-value",
-			Domain:   "www.google.com",
-			Path:     "/",
-			Secure:   false,
-			HttpOnly: false,
-			Expires:  tNow.Add(24 * time.Hour),
-		},
-	},
-}, {
-	about: "expired cookie",
-	set: []setCommand{{
-		url: mustParseURL("https://www.google.com/"),
-		cookies: []*http.Cookie{
-			{
-				Name:    "test-cookie",
-				Value:   "test-value",
-				Expires: tNow.Add(-24 * time.Hour),
-			},
-		},
-	}},
-}, {
-	about: "cookie for subpath",
-	set: []setCommand{{
-		url: mustParseURL("https://www.google.com/subpath/place"),
-		cookies: []*http.Cookie{
-			{
-				Name:    "test-cookie",
-				Value:   "test-value",
-				Expires: tNow.Add(24 * time.Hour),
-			},
-		},
-	}},
-	expectCookies: []*http.Cookie{
-		{
-			Name:     "test-cookie",
-			Value:    "test-value",
-			Domain:   "www.google.com",
-			Path:     "/subpath",
-			Secure:   false,
-			HttpOnly: false,
-			Expires:  tNow.Add(24 * time.Hour),
-		},
-	},
-}, {
-	about: "multiple cookies",
-	set: []setCommand{{
-		url: mustParseURL("https://www.google.com/"),
-		cookies: []*http.Cookie{
-			{
-				Name:    "test-cookie",
-				Value:   "test-value",
-				Expires: tNow.Add(24 * time.Hour),
-			},
-		},
-	}, {
-		url: mustParseURL("https://www.google.com/subpath/"),
-		cookies: []*http.Cookie{
-			{
-				Name:    "test-cookie",
-				Value:   "test-value",
-				Expires: tNow.Add(24 * time.Hour),
-			},
-		},
-	}},
-	expectCookies: []*http.Cookie{
-		{
-			Name:     "test-cookie",
-			Value:    "test-value",
-			Domain:   "www.google.com",
-			Path:     "/subpath",
-			Secure:   false,
-			HttpOnly: false,
-			Expires:  tNow.Add(24 * time.Hour),
-		},
-		{
-			Name:     "test-cookie",
-			Value:    "test-value",
-			Domain:   "www.google.com",
-			Path:     "/",
-			Secure:   false,
-			HttpOnly: false,
-			Expires:  tNow.Add(24 * time.Hour),
-		},
-	},
-}}
-
-func TestAllCookies(t *testing.T) {
-	dir, err := os.MkdirTemp("", "cookiejar-test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(dir)
-	for i, test := range allCookiesTests {
-		path := filepath.Join(dir, fmt.Sprintf("jar%d", i))
-		jar := newTestJar(path)
-		for _, s := range test.set {
-			jar.setCookies(s.url, s.cookies, tNow)
-		}
-		gotCookies := jar.allCookies(tNow)
-		if len(gotCookies) != len(test.expectCookies) {
-			t.Fatalf("Test %q: unexpected number of cookies returned, expected: %d, got: %d", test.about, len(test.expectCookies), len(gotCookies))
-		}
-		for j, c := range test.expectCookies {
-			if !cookiesEqual(c, gotCookies[j]) {
-				t.Fatalf("Test %q: mismatch in cookies[%d], expected: %#v, got: %#v", test.about, j, *c, *gotCookies[j])
-			}
-		}
-	}
-}
-
-func TestRemoveCookies(t *testing.T) {
-	jar := newTestJar("")
-	jar.SetCookies(
-		mustParseURL("https://www.google.com"),
-		[]*http.Cookie{
-			{
-				Name:    "test-cookie",
-				Value:   "test-value",
-				Expires: time.Now().Add(24 * time.Hour),
-			},
-			{
-				Name:    "test-cookie2",
-				Value:   "test-value",
-				Expires: time.Now().Add(24 * time.Hour),
-			},
-		},
-	)
-	cookies := jar.AllCookies()
-	if len(cookies) != 2 {
-		t.Fatalf("Expected 2 cookies got %d", len(cookies))
-	}
-	jar.RemoveCookie(cookies[0])
-	cookies2 := jar.AllCookies()
-	if len(cookies2) != 1 {
-		t.Fatalf("Expected 1 cookie got %d", len(cookies))
-	}
-	if !cookiesEqual(cookies[1], cookies2[0]) {
-		t.Fatalf("Unexpected cookie removed")
-	}
-}
-
-func TestRemoveAllHost(t *testing.T) {
-	testRemoveAllHost(t, mustParseURL("https://www.apple.com"), "www.apple.com", true)
-}
-
-func TestRemoveAllHostRoot(t *testing.T) {
-	testRemoveAllHost(t, mustParseURL("https://www.apple.com"), "apple.com", false)
-}
-
-func TestRemoveAllHostDifferent(t *testing.T) {
-	testRemoveAllHost(t, mustParseURL("https://www.apple.com"), "foo.apple.com", false)
-}
-
-func TestRemoveAllHostWithPort(t *testing.T) {
-	testRemoveAllHost(t, mustParseURL("https://www.apple.com"), "www.apple.com:80", true)
-}
-
-func TestRemoveAllHostIP(t *testing.T) {
-	testRemoveAllHost(t, mustParseURL("https://10.1.1.1"), "10.1.1.1", true)
-}
-
-func testRemoveAllHost(t *testing.T, setURL *url.URL, removeHost string, shouldRemove bool) {
-	jar := newTestJar("")
-	google := mustParseURL("https://www.google.com")
-	jar.SetCookies(
-		google,
-		[]*http.Cookie{
-			{
-				Name:    "test-cookie",
-				Value:   "test-value",
-				Expires: time.Now().Add(24 * time.Hour),
-			},
-			{
-				Name:    "test-cookie2",
-				Value:   "test-value",
-				Expires: time.Now().Add(24 * time.Hour),
-			},
-		},
-	)
-	onlyGoogle := jar.AllCookies()
-	if len(onlyGoogle) != 2 {
-		t.Fatalf("Expected 2 cookies, got %d", len(onlyGoogle))
-	}
-
-	jar.SetCookies(
-		setURL,
-		[]*http.Cookie{
-			{
-				Name:    "test-cookie3",
-				Value:   "test-value",
-				Expires: time.Now().Add(24 * time.Hour),
-			},
-			{
-				Name:    "test-cookie4",
-				Value:   "test-value",
-				Expires: time.Now().Add(24 * time.Hour),
-			},
-		},
-	)
-	withSet := jar.AllCookies()
-	if len(withSet) != 4 {
-		t.Fatalf("Expected 4 cookies, got %d", len(withSet))
-	}
-	jar.RemoveAllHost(removeHost)
-	after := jar.AllCookies()
-	if !shouldRemove {
-		if len(after) != len(withSet) {
-			t.Fatalf("Expected %d cookies, got %d", len(withSet), len(after))
-		}
-		return
-	}
-	if len(after) != len(onlyGoogle) {
-		t.Fatalf("Expected %d cookies, got %d", len(onlyGoogle), len(after))
-	}
-	if !cookiesEqual(onlyGoogle[0], after[0]) {
-		t.Fatalf("Expected %v, got %v", onlyGoogle[0], after[0])
-	}
-	if !cookiesEqual(onlyGoogle[1], after[1]) {
-		t.Fatalf("Expected %v, got %v", onlyGoogle[1], after[1])
-	}
-}
-
-func TestRemoveAll(t *testing.T) {
-	jar := newTestJar("")
-	jar.SetCookies(
-		mustParseURL("https://www.google.com"),
-		[]*http.Cookie{
-			{
-				Name:    "test-cookie",
-				Value:   "test-value",
-				Expires: time.Now().Add(24 * time.Hour),
-			},
-			{
-				Name:    "test-cookie2",
-				Value:   "test-value",
-				Expires: time.Now().Add(24 * time.Hour),
-			},
-		},
-	)
-	jar.SetCookies(
-		mustParseURL("https://foo.com"),
-		[]*http.Cookie{
-			{
-				Name:    "test-cookie3",
-				Value:   "test-value",
-				Expires: time.Now().Add(24 * time.Hour),
-			},
-			{
-				Name:    "test-cookie4",
-				Value:   "test-value",
-				Expires: time.Now().Add(24 * time.Hour),
-			},
-		},
-	)
-	jar.RemoveAll()
-	if after := len(jar.AllCookies()); after != 0 {
-		t.Fatalf("%d cookies remaining after RemoveAll", after)
-	}
-}
-
-func cookiesEqual(a, b *http.Cookie) bool {
-	return a.Name == b.Name &&
-		a.Value == b.Value &&
-		a.Domain == b.Domain &&
-		a.Path == b.Path &&
-		a.Expires.Equal(b.Expires) &&
-		a.HttpOnly == b.HttpOnly &&
-		a.Secure == b.Secure
 }

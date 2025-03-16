@@ -6,14 +6,21 @@ package cookiejar
 
 import (
 	"encoding/json"
-	"fmt"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"time"
 )
+
+func Load(filename string, o *Options) (j *Jar, err error) {
+	if o == nil {
+		o = &Options{}
+	}
+	o.Filename = filename
+	return New(o)
+}
 
 // Save saves the cookies to the persistent cookie file.
 // Before the file is written, it reads any cookies that
@@ -47,17 +54,7 @@ func (j *Jar) save(filename string, now time.Time) error {
 
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	if err := j.mergeFrom(f); err != nil {
-		// The cookie file is probably corrupt.
-		log.Printf("cannot read cookie file to merge it; ignoring it: %v", err)
-	}
 	j.deleteExpired(now)
-	if err := f.Truncate(0); err != nil {
-		return fmt.Errorf("cannot truncate file: %w", err)
-	}
-	if _, err := f.Seek(0, 0); err != nil {
-		return err
-	}
 	return j.writeTo(f)
 }
 
@@ -78,15 +75,7 @@ func (j *Jar) load(filename string) error {
 		return err
 	}
 	defer f.Close()
-	if err := j.mergeFrom(f); err != nil {
-		return err
-	}
-	return nil
-}
-
-// mergeFrom reads all the cookies from r and stores them in the Jar.
-func (j *Jar) mergeFrom(r io.Reader) error {
-	decoder := json.NewDecoder(r)
+	decoder := json.NewDecoder(f)
 	// Cope with old cookiejar format by just discarding
 	// cookies, but still return an error if it's invalid JSON.
 	var data json.RawMessage
@@ -102,7 +91,26 @@ func (j *Jar) mergeFrom(r io.Reader) error {
 		log.Printf("warning: discarding cookies in invalid format (error: %v)", err)
 		return nil
 	}
-	j.merge(entries)
+
+	for _, e := range entries {
+		if e.CanonicalHost == "" {
+			continue
+		}
+		key := jarKey(e.CanonicalHost, j.psList)
+		id := e.id()
+		submap := j.entries[key]
+		if submap == nil {
+			submap = map[string]entry{}
+			j.entries[key] = submap
+		}
+		oldEntry, ok := submap[id]
+		if !ok || e.Updated.After(oldEntry.Updated) {
+			e.seqNum = j.nextSeqNum
+			j.nextSeqNum += 1
+			submap[id] = e
+		}
+	}
+
 	return nil
 }
 
@@ -111,10 +119,36 @@ func (j *Jar) mergeFrom(r io.Reader) error {
 func (j *Jar) writeTo(w io.Writer) error {
 	encoder := json.NewEncoder(w)
 	entries := j.allPersistentEntries()
+	slices.SortFunc(entries, func(e1, e2 entry) int {
+		switch {
+		case e1.seqNum < e2.seqNum:
+			return -1
+		case e1.seqNum > e2.seqNum:
+			return 1
+		default:
+			return 0
+		}
+	})
 	if err := encoder.Encode(entries); err != nil {
 		return err
 	}
 	return nil
+}
+
+// deleteExpired deletes all entries that have expired for long enough
+// that we can actually expect there to be no external copies of it that
+// might resurrect the dead cookie.
+func (j *Jar) deleteExpired(now time.Time) {
+	for tld, submap := range j.entries {
+		for id, e := range submap {
+			if !e.Expires.After(now) && !e.Updated.Add(24*time.Hour).After(now) {
+				delete(submap, id)
+			}
+		}
+		if len(submap) == 0 {
+			delete(j.entries, tld)
+		}
+	}
 }
 
 // allPersistentEntries returns all the entries in the jar, sorted by primarly by canonical host
@@ -128,6 +162,5 @@ func (j *Jar) allPersistentEntries() []entry {
 			}
 		}
 	}
-	sort.Sort(byCanonicalHost{entries})
 	return entries
 }
