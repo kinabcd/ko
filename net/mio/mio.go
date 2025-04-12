@@ -28,14 +28,22 @@ type PingTimeout time.Duration
 type Conn interface {
 	koNet.ContextDialer
 	koNet.Listener
+	// Done returns a channel that will be closed when the connection is closed.
 	Done() <-chan struct{}
+	// SubConns returns a map of the currently active sub-connections. The keys of the map are the sub-connection IDs.
 	SubConns() map[uint16]SubConn
+	// LocalAddr returns the local network address.
 	LocalAddr() net.Addr
+	// RemoteAddr returns the remote network address.
 	RemoteAddr() net.Addr
+	// Latency returns the current estimated round-trip time (RTT) or latency to the remote peer.
 	Latency() time.Duration
 }
 type SubConn interface {
+	// Id returns the unique identifier for this sub-connection.
 	Id() uint16
+	// LocalAddr returns the local network address for this sub-connection.
 	LocalAddr() net.Addr
+	// RemoteAddr returns the remote network address for this sub-connection.
 	RemoteAddr() net.Addr
 }
