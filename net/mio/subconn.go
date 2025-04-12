@@ -165,12 +165,9 @@ func (m *subConn) Write(b []byte) (n int, err error) {
 		deadLine = timeout
 		defer cancelFunc()
 	}
-	maxSize := m.mainConn.MaxWriteSize
+	maxSize := m.mainConn.maxWriteSize
 	for len(b) > n {
-		wn := len(b) - n
-		if wn > maxSize {
-			wn = maxSize
-		}
+		wn := min(len(b)-n, maxSize)
 		lenBytes := binary.BigEndian.AppendUint16([]byte{}, uint16(wn))
 		select {
 		case m.mainConn.writeChan <- mioDataMessage{

@@ -15,6 +15,15 @@ var (
 	ErrReadBufIsFull     error = errors.New("read buf is full")
 )
 
+// MaxWriteSize, the data payload size, must be between 1 and 65535 bytes.
+type MaxWriteSize int
+
+// PingInterval specifies the interval at which ping messages are sent to check the connection latency.
+type PingInterval time.Duration
+
+// PingTimeout specifies the maximum amount of time to wait for a response to a ping message when checking connection latency.
+type PingTimeout time.Duration
+
 // Multi-connections in one connection. A pipeListener on net.Conn.
 type Conn interface {
 	koNet.ContextDialer
@@ -23,7 +32,6 @@ type Conn interface {
 	SubConns() map[uint16]SubConn
 	LocalAddr() net.Addr
 	RemoteAddr() net.Addr
-	KeepAlive(duration time.Duration)
 	Latency() time.Duration
 }
 type SubConn interface {

@@ -21,8 +21,9 @@ var (
 )
 
 type conn struct {
-	// MaxWriteSize, the data payload size, must be between 1 and 65535 bytes.
-	MaxWriteSize int
+	maxWriteSize int
+	pingInterval time.Duration
+	pingTimeout  time.Duration
 
 	conn       net.Conn
 	acceptChan chan *subConn
@@ -49,7 +50,7 @@ type conn struct {
 	version byte
 }
 
-func New(c net.Conn) (m *conn) {
+func New(c net.Conn, options ...any) (m *conn) {
 	baseContext, cancel := context.WithCancel(context.Background())
 	handshakeContext, handshakeDone := context.WithCancel(baseContext)
 	m = &conn{
@@ -66,7 +67,18 @@ func New(c net.Conn) (m *conn) {
 		handshakeContext: handshakeContext,
 		handshakeDone:    handshakeDone,
 
-		MaxWriteSize: 65535,
+		maxWriteSize: 65535,
+		pingInterval: 15 * time.Second,
+	}
+	for _, o := range options {
+		switch v := o.(type) {
+		case MaxWriteSize:
+			m.maxWriteSize = int(v)
+		case PingInterval:
+			m.pingInterval = time.Duration(v)
+		case PingTimeout:
+			m.pingTimeout = time.Duration(v)
+		}
 	}
 	return
 }
@@ -160,7 +172,7 @@ func (m *conn) handshake() (err error) {
 			}
 		}()
 
-		go m.testLatency()
+		go m.keepAlive(m.pingInterval)
 		return
 	}
 }
@@ -266,7 +278,7 @@ func (m *conn) nextIdLocked() uint16 {
 	}
 }
 
-func (m *conn) Ping() (time.Duration, error) {
+func (m *conn) ping() (time.Duration, error) {
 	var n uint16
 	ch := make(chan struct{})
 	m.pingLock.Lock()
@@ -284,7 +296,7 @@ func (m *conn) Ping() (time.Duration, error) {
 	}
 	m.pings[n] = ch
 	m.pingLock.Unlock()
-	ctx, cancel := context.WithTimeout(m.ctx, 15*time.Second)
+	ctx, cancel := context.WithTimeout(m.ctx, m.pingTimeout)
 	defer cancel()
 	defer func() {
 		m.pingLock.Lock()
@@ -344,20 +356,21 @@ func (m *conn) Accept() (conn net.Conn, e error) {
 		return nil, net.ErrClosed
 	}
 }
-func (m *conn) KeepAlive(duration time.Duration) {
+func (m *conn) keepAlive(duration time.Duration) {
 	if m.handshakeContext.Err() == nil {
 		go m.handshake()
 		<-m.handshakeContext.Done()
 	}
+	go m.testLatency()
 	for koTime.SleepContext(m.ctx, duration) {
 		go m.testLatency()
 	}
 }
 
 func (m *conn) testLatency() {
-	latency, err := m.Ping()
+	latency, err := m.ping()
 	if err != nil {
-		return
+		latency = m.pingTimeout
 	}
 	m.pingLock.Lock()
 	defer m.pingLock.Unlock()
