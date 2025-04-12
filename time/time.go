@@ -23,3 +23,9 @@ func NextDayOf(from time.Time, hour, minute int) time.Time {
 func UntilNextDay(hour, minute int) time.Duration {
 	return time.Until(NextDay(hour, minute))
 }
+
+// Today returns the current date with the time set to midnight (00:00:00) in the current location.
+func Today() time.Time {
+	now := time.Now()
+	return time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+}
