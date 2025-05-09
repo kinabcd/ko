@@ -1,4 +1,4 @@
-package http
+package httpproxy
 
 import (
 	"bufio"
@@ -11,10 +11,11 @@ import (
 	"net/url"
 
 	koNet "github.com/kinabcd/ko/net"
+	koHttp "github.com/kinabcd/ko/net/http"
 )
 
-// ProxyDialer is a HTTP/HTTPS connect proxy.
-type ProxyDialer struct {
+// Dialer is a HTTP/HTTPS connect proxy.
+type Dialer struct {
 	ProxyUrl *url.URL
 
 	// Dialer specifies an optional dial function with context for
@@ -24,7 +25,7 @@ type ProxyDialer struct {
 	Dialer koNet.ContextDialer
 }
 
-func (s *ProxyDialer) DialContext(ctx context.Context, network, addr string) (conn net.Conn, err error) {
+func (s *Dialer) DialContext(ctx context.Context, network, addr string) (conn net.Conn, err error) {
 	dialer := s.Dialer
 	if dialer == nil {
 		dialer = &net.Dialer{}
@@ -50,7 +51,7 @@ func (s *ProxyDialer) DialContext(ctx context.Context, network, addr string) (co
 	if proxyURL.User != nil {
 		username := proxyURL.User.Username()
 		password, _ := proxyURL.User.Password()
-		req.Header.Add("Proxy-Authorization", EncodeBasicAuth(username, password))
+		req.Header.Add("Proxy-Authorization", koHttp.EncodeBasicAuth(username, password))
 	}
 
 	// Dial and create the https client connection.

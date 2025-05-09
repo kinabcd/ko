@@ -1,4 +1,4 @@
-package http
+package httpproxy
 
 import (
 	"context"
@@ -12,6 +12,7 @@ import (
 
 	koIo "github.com/kinabcd/ko/io"
 	koNet "github.com/kinabcd/ko/net"
+	koHttp "github.com/kinabcd/ko/net/http"
 )
 
 // Hop-by-hop headers. These are removed when sent to the backend.
@@ -64,7 +65,7 @@ func appendHostToXForwardHeader(header http.Header, host string) {
 
 // A Server defines parameters for running an HTTP PROXY server.
 // The zero value for Server is a valid configuration.
-type ProxyServer struct {
+type Server struct {
 	// Dialer specifies an optional ContextDialer.
 	// If non-nil, it will be used in http.Transport of outbound client.
 	Dialer koNet.ContextDialer
@@ -88,12 +89,12 @@ type ProxyServer struct {
 	client *http.Client
 }
 
-func (p *ProxyServer) Serve(l net.Listener) error {
+func (p *Server) Serve(l net.Listener) error {
 	s := http.Server{Handler: p}
 	return s.Serve(l)
 }
 
-func (p *ProxyServer) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
+func (p *Server) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 	if !p.isAllowedProxyRequest(req) {
 		if p.Fallback != nil {
 			p.Fallback.ServeHTTP(wr, req)
@@ -104,7 +105,7 @@ func (p *ProxyServer) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 	}
 	if p.AuthHandler != nil {
 		pa := req.Header.Get("Proxy-Authorization")
-		pau, pap, ok := DecodeBasicAuth(pa)
+		pau, pap, ok := koHttp.DecodeBasicAuth(pa)
 		ok = ok && p.AuthHandler(pau, pap)
 		if !ok {
 			wr.Header().Add("Proxy-Authenticate", "Basic")
@@ -121,7 +122,7 @@ func (p *ProxyServer) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 	}
 }
 
-func (p *ProxyServer) isAllowedProxyRequest(req *http.Request) bool {
+func (p *Server) isAllowedProxyRequest(req *http.Request) bool {
 	var hostport string
 	if req.Method == http.MethodConnect {
 		hostport = req.RequestURI
@@ -163,18 +164,18 @@ func (p *ProxyServer) isAllowedProxyRequest(req *http.Request) bool {
 	return true
 }
 
-func (p *ProxyServer) logD(msg string, args ...any) {
+func (p *Server) logD(msg string, args ...any) {
 	if p.Logger != nil {
 		p.Logger.Debug(msg, args...)
 	}
 }
-func (p *ProxyServer) logW(msg string, args ...any) {
+func (p *Server) logW(msg string, args ...any) {
 	if p.Logger != nil {
 		p.Logger.Warn(msg, args...)
 	}
 }
 
-func (p *ProxyServer) serveOthers(wr http.ResponseWriter, req *http.Request) {
+func (p *Server) serveOthers(wr http.ResponseWriter, req *http.Request) {
 	if req.URL.Scheme == "" {
 		req.URL.Scheme = "http"
 	}
@@ -228,7 +229,7 @@ func (p *ProxyServer) serveOthers(wr http.ResponseWriter, req *http.Request) {
 	io.Copy(wr, resp.Body)
 }
 
-func (p *ProxyServer) serveConnect(wr http.ResponseWriter, req *http.Request) {
+func (p *Server) serveConnect(wr http.ResponseWriter, req *http.Request) {
 	defer req.Body.Close()
 	p.logD(req.Method, slog.Any("url", req.RequestURI), slog.String("proto", req.Proto))
 	if hostname, port, err := net.SplitHostPort(req.RequestURI); err != nil || hostname == "" {

@@ -1,4 +1,4 @@
-package http_test
+package httpproxy_test
 
 import (
 	"bufio"
@@ -13,7 +13,7 @@ import (
 	"testing"
 
 	koNet "github.com/kinabcd/ko/net"
-	koHttp "github.com/kinabcd/ko/net/http"
+	"github.com/kinabcd/ko/net/http/httpproxy"
 	koTesting "github.com/kinabcd/ko/testing"
 )
 
@@ -63,7 +63,7 @@ func (record *echoHttpDialer) DialContext(ctx context.Context, network, address 
 	return c1, nil
 }
 func TestProxyServer(t *testing.T) {
-	server := &koHttp.ProxyServer{
+	server := &httpproxy.Server{
 		Dialer: &echoHttpDialer{},
 		Logger: slog.Default(),
 	}
@@ -88,7 +88,7 @@ func TestProxyServer(t *testing.T) {
 }
 
 func TestProxyServerPassword(t *testing.T) {
-	server := &koHttp.ProxyServer{
+	server := &httpproxy.Server{
 		Dialer: &echoHttpDialer{},
 		AuthHandler: func(username, password string) bool {
 			return username == "123" && password == "456"
