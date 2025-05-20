@@ -22,6 +22,8 @@ type subConn struct {
 	idBytes  []byte
 	mainConn *conn
 
+	dialContext context.Context
+
 	localAddr  net.Addr
 	remoteAddr net.Addr
 
@@ -39,14 +41,15 @@ type subConn struct {
 	writeDeadline time.Time
 }
 
-func newMioSubConn(ctx context.Context, id uint16, mainConn *conn, localAddr, remoteAddr net.Addr) *subConn {
+func newMioSubConn(ctx context.Context, id uint16, mainConn *conn, localAddr, remoteAddr net.Addr, dialContext context.Context) *subConn {
 	idBytes := binary.BigEndian.AppendUint16([]byte{}, id)
 	baseContext, cancelFunc := context.WithCancelCause(ctx)
 	dialing, dialingDone := context.WithCancel(baseContext)
 	return &subConn{
-		id:       id,
-		idBytes:  idBytes,
-		mainConn: mainConn,
+		id:          id,
+		idBytes:     idBytes,
+		mainConn:    mainConn,
+		dialContext: dialContext,
 
 		localAddr:  localAddr,
 		remoteAddr: remoteAddr,
@@ -212,4 +215,12 @@ func (m *subConn) SetReadDeadline(t time.Time) error {
 func (m *subConn) SetWriteDeadline(t time.Time) error {
 	m.writeDeadline = t
 	return nil
+}
+
+func (m *subConn) Context() context.Context {
+	if m.dialContext != nil {
+		return m.dialContext
+	} else {
+		return context.Background()
+	}
 }

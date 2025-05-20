@@ -200,7 +200,7 @@ func (m *conn) processNextPack() (err error) {
 		} else {
 			localAddr = &subAddr{network: u.Scheme, address: u.Host}
 		}
-		c := newMioSubConn(m.ctx, id, m, localAddr, m.conn.RemoteAddr())
+		c := newMioSubConn(m.ctx, id, m, localAddr, m.conn.RemoteAddr(), context.Background())
 		m.subConns[c.id] = c
 		select {
 		case m.acceptChan <- c:
@@ -395,10 +395,10 @@ func (m *conn) Latency() time.Duration {
 	return time.Duration(int64(sumLatency) / int64(lenLatency))
 }
 
-func (m *conn) newSubConn(network, addr string) *subConn {
+func (m *conn) newSubConn(network, addr string, dialContext context.Context) *subConn {
 	m.subConnLock.Lock()
 	defer m.subConnLock.Unlock()
-	c := newMioSubConn(m.ctx, m.nextIdLocked(), m, m.conn.LocalAddr(), &subAddr{network: network, address: addr})
+	c := newMioSubConn(m.ctx, m.nextIdLocked(), m, m.conn.LocalAddr(), &subAddr{network: network, address: addr}, dialContext)
 	m.subConns[c.id] = c
 	return c
 }
@@ -411,7 +411,7 @@ func (m *conn) DialContext(ctx context.Context, network, addr string) (conn net.
 		case <-m.handshakeContext.Done():
 		}
 	}
-	sc := m.newSubConn(network, addr)
+	sc := m.newSubConn(network, addr, ctx)
 	if e = sc.dial(ctx); e != nil {
 		go sc.CloseCause(e)
 		return nil, e

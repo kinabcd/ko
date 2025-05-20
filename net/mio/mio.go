@@ -1,6 +1,7 @@
 package mio
 
 import (
+	"context"
 	"errors"
 	"net"
 	"time"
@@ -46,4 +47,6 @@ type SubConn interface {
 	LocalAddr() net.Addr
 	// RemoteAddr returns the remote network address for this sub-connection.
 	RemoteAddr() net.Addr
+	// Context returns the Dial's context.
+	Context() context.Context
 }

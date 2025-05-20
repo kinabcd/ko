@@ -13,6 +13,11 @@ import (
 	koTime "github.com/kinabcd/ko/time"
 )
 
+type Request struct {
+	Version int
+	Address string
+}
+
 // A Server defines parameters for running an SOCKS4/SOCKS5 server.
 // The zero value for Server is a valid configuration.
 type Server struct {
@@ -27,6 +32,12 @@ type Server struct {
 	// Handle authorization. AuthMethodNotRequired if nil
 	// If AuthHandler is not nil, SOCKS4(a) server will not serve.
 	AuthHandler func(username, password string) bool
+
+	// ConnContext optionally specifies a function that modifies
+	// the context used for a new connection c. The provided ctx
+	// is derived from the base context and has a ServerContextKey
+	// value.
+	ConnContext func(ctx context.Context, c net.Conn, req *Request) context.Context
 }
 
 func (srv *Server) Serve(l koNet.Listener) error {
@@ -43,7 +54,7 @@ func (srv *Server) Serve(l koNet.Listener) error {
 			return err
 		}
 		go func() {
-			if srv.ServeSOCKS(conn); err != nil {
+			if srv.ServeConn(baseCtx, conn); err != nil {
 				srv.logW("handle conn failed", "err", err)
 			}
 		}()
@@ -69,20 +80,20 @@ func (p *Server) logW(msg string, args ...any) {
 	}
 }
 
-func (srv *Server) ServeSOCKS(conn net.Conn) error {
+func (srv *Server) ServeConn(ctx context.Context, conn net.Conn) error {
 	defer conn.Close()
 	if version, err := koIo.ReadByte(conn); err != nil {
 		return err
 	} else if version == Version4 {
-		return srv.serveSOCKS4(conn)
+		return srv.serveSOCKS4(ctx, conn)
 	} else if version == Version5 {
-		return srv.serveSOCKS5(conn)
+		return srv.serveSOCKS5(ctx, conn)
 	} else {
 		return ErrWrongProtocol
 	}
 }
 
-func (srv *Server) serveSOCKS4(conn net.Conn) (err error) {
+func (srv *Server) serveSOCKS4(ctx context.Context, conn net.Conn) (err error) {
 	var address string
 	var portByte [2]byte
 	var ipByte [4]byte
@@ -94,8 +105,14 @@ func (srv *Server) serveSOCKS4(conn net.Conn) (err error) {
 	if srv.AuthHandler != nil {
 		return ErrAuthFailed
 	}
+	if srv.ConnContext != nil {
+		ctx = srv.ConnContext(ctx, conn, &Request{
+			Version: Version4,
+			Address: address,
+		})
+	}
 	var outConn net.Conn
-	if outConn, err = srv.getDialer().DialContext(context.Background(), "tcp", address); err != nil {
+	if outConn, err = srv.getDialer().DialContext(ctx, "tcp", address); err != nil {
 		return fmt.Errorf("dial failed %w", err)
 	}
 	defer outConn.Close()
@@ -107,7 +124,7 @@ func (srv *Server) serveSOCKS4(conn net.Conn) (err error) {
 	return nil
 }
 
-func (srv *Server) serveSOCKS5(conn net.Conn) (err error) {
+func (srv *Server) serveSOCKS5(ctx context.Context, conn net.Conn) (err error) {
 	var methods []byte
 	if methods, err = readSOCKS5Header(conn); err != nil {
 		err = fmt.Errorf("wrong header: %w", err)
@@ -144,8 +161,14 @@ func (srv *Server) serveSOCKS5(conn net.Conn) (err error) {
 	}
 
 	srv.logD("Connect", "proto", "SOCKS5", "address", address)
+	if srv.ConnContext != nil {
+		ctx = srv.ConnContext(ctx, conn, &Request{
+			Version: Version5,
+			Address: address,
+		})
+	}
 	var outConn net.Conn
-	if outConn, err = srv.getDialer().DialContext(context.Background(), "tcp", address); err != nil {
+	if outConn, err = srv.getDialer().DialContext(ctx, "tcp", address); err != nil {
 		writeSOCKS5Response(conn, StatusNetworkUnreachable)
 		err = fmt.Errorf("dial failed: %w", err)
 		return

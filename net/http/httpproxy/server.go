@@ -1,7 +1,6 @@
 package httpproxy
 
 import (
-	"context"
 	"io"
 	"log/slog"
 	"net"
@@ -244,7 +243,7 @@ func (p *Server) serveConnect(wr http.ResponseWriter, req *http.Request) {
 		dialer = &net.Dialer{}
 	}
 
-	if outConn, err := dialer.DialContext(context.Background(), "tcp", req.RequestURI); err == nil {
+	if outConn, err := dialer.DialContext(req.Context(), "tcp", req.RequestURI); err == nil {
 		defer outConn.Close()
 		rc := http.NewResponseController(wr)
 		if req.ProtoMajor >= 2 {
