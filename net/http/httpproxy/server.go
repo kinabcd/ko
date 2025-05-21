@@ -199,6 +199,9 @@ func (p *Server) serveOthers(wr http.ResponseWriter, req *http.Request) {
 				DialContext:     dialContext,
 				IdleConnTimeout: 5 * time.Minute,
 			},
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
 			Jar: nil,
 		}
 	}
