@@ -11,7 +11,6 @@ import (
 
 	koIo "github.com/kinabcd/ko/io"
 	koNet "github.com/kinabcd/ko/net"
-	koTime "github.com/kinabcd/ko/time"
 )
 
 var (
@@ -110,8 +109,16 @@ func (m *conn) handshake() (err error) {
 	defer m.handshakeDone()
 	c := m.conn
 	go func() {
+		pingTick := time.Tick(m.pingInterval)
+		if pingTick == nil {
+			pingTick = make(<-chan time.Time) // never trigger
+		}
 		for {
 			select {
+			case <-pingTick:
+				if m.handshakeContext.Err() != nil {
+					go m.testLatency()
+				}
 			case msg := <-m.writeChan:
 				m.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 				_, msg.Err = m.conn.Write(msg.DataPrefix)
@@ -172,7 +179,9 @@ func (m *conn) handshake() (err error) {
 			}
 		}()
 
-		go m.keepAlive(m.pingInterval)
+		if m.pingInterval > 0 {
+			go m.testLatency()
+		}
 		return
 	}
 }
@@ -263,18 +272,11 @@ func (m *conn) processNextPack() (err error) {
 	return nil
 }
 
-func (m *conn) nextIdLocked() uint16 {
-	for {
-		n := m.subIdNext
-		m.subIdNext += 1
-		if m.isMain {
-			n &= 0x7FFF
-		} else {
-			n |= 0x8000
-		}
-		if _, ok := m.subConns[n]; !ok {
-			return n
-		}
+func (m *conn) maskId(n uint16) uint16 {
+	if m.isMain {
+		return n & 0x7FFF
+	} else {
+		return n | 0x8000
 	}
 }
 
@@ -283,13 +285,8 @@ func (m *conn) ping() (time.Duration, error) {
 	ch := make(chan struct{})
 	m.pingLock.Lock()
 	for {
-		n = m.pingNext
+		n = m.maskId(m.pingNext)
 		m.pingNext += 1
-		if m.isMain {
-			n &= 0x7FFF
-		} else {
-			n |= 0x8000
-		}
 		if _, ok := m.pings[n]; !ok {
 			break
 		}
@@ -356,16 +353,6 @@ func (m *conn) Accept() (conn net.Conn, e error) {
 		return nil, net.ErrClosed
 	}
 }
-func (m *conn) keepAlive(duration time.Duration) {
-	if m.handshakeContext.Err() == nil {
-		go m.handshake()
-		<-m.handshakeContext.Done()
-	}
-	go m.testLatency()
-	for koTime.SleepContext(m.ctx, duration) {
-		go m.testLatency()
-	}
-}
 
 func (m *conn) testLatency() {
 	latency, err := m.ping()
@@ -398,8 +385,16 @@ func (m *conn) Latency() time.Duration {
 func (m *conn) newSubConn(network, addr string, dialContext context.Context) *subConn {
 	m.subConnLock.Lock()
 	defer m.subConnLock.Unlock()
-	c := newMioSubConn(m.ctx, m.nextIdLocked(), m, m.conn.LocalAddr(), &subAddr{network: network, address: addr}, dialContext)
-	m.subConns[c.id] = c
+	var n uint16
+	for {
+		n = m.maskId(m.subIdNext)
+		m.subIdNext += 1
+		if _, ok := m.subConns[n]; !ok {
+			break
+		}
+	}
+	c := newMioSubConn(m.ctx, n, m, m.conn.LocalAddr(), &subAddr{network: network, address: addr}, dialContext)
+	m.subConns[n] = c
 	return c
 }
 func (m *conn) DialContext(ctx context.Context, network, addr string) (conn net.Conn, e error) {
