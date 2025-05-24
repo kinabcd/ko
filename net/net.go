@@ -7,6 +7,9 @@ import (
 
 // A ContextDialer dials using a context.
 type ContextDialer interface {
+	// Returns connection if successful, or an error.
+	// The context is used to cancel the dial. It will return a non-nil error if the context is done.
+	// ctx should be ignored after connection is established.
 	DialContext(ctx context.Context, network, address string) (net.Conn, error)
 }
 
@@ -39,6 +42,8 @@ type Listener net.Listener
 
 type Forwarder interface {
 	// Forward() a conn and someone may Accept() it from Listener
+	// Returns nil if the connection is accepted.
+	// ctx should be ignored after connection is accepted.
 	Forward(ctx context.Context, c net.Conn) error
 }
 
