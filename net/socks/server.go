@@ -38,23 +38,33 @@ type Server struct {
 	// is derived from the base context and has a ServerContextKey
 	// value.
 	ConnContext func(ctx context.Context, c net.Conn, req *Request) context.Context
+
+	// Context is used to shut down the server.
+	// If not nil, the server will be shut down when the context is done.
+	Context context.Context
 }
 
+// Serve accepts incoming connections on the listener l and
+// serves requests for SOCKS4/SOCKS5 connections.
+// Returns when the listener is closed or an error occurs.
 func (srv *Server) Serve(l koNet.Listener) error {
 	defer l.Close()
-	baseCtx := context.Background()
+	ctx := srv.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	for {
 		conn, err := l.Accept()
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				srv.logW("Accept timeout", "err", err)
-				koTime.SleepContext(baseCtx, 100*time.Millisecond)
+				koTime.SleepContext(ctx, 100*time.Millisecond)
 				continue
 			}
 			return err
 		}
 		go func() {
-			if srv.ServeConn(baseCtx, conn); err != nil {
+			if srv.ServeConn(conn); err != nil {
 				srv.logW("handle conn failed", "err", err)
 			}
 		}()
@@ -80,8 +90,24 @@ func (p *Server) logW(msg string, args ...any) {
 	}
 }
 
-func (srv *Server) ServeConn(ctx context.Context, conn net.Conn) error {
+// ServeConn serves a single connection.
+// Returns when the connection is closed or an error occurs.
+func (srv *Server) ServeConn(conn net.Conn) error {
+	ctx := srv.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	defer conn.Close()
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		<-ctx.Done()
+		conn.Close()
+	}()
+
 	if version, err := koIo.ReadByte(conn); err != nil {
 		return err
 	} else if version == Version4 {
