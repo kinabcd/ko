@@ -39,6 +39,10 @@ type subConn struct {
 
 	readDeadline  time.Time
 	writeDeadline time.Time
+
+	readAckCount  uint16
+	writeAckCount uint16
+	writeAckChan  chan struct{}
 }
 
 func newMioSubConn(ctx context.Context, id uint16, mainConn *conn, localAddr, remoteAddr net.Addr, dialContext context.Context) *subConn {
@@ -62,6 +66,10 @@ func newMioSubConn(ctx context.Context, id uint16, mainConn *conn, localAddr, re
 
 		dialing:     dialing,
 		dialingDone: dialingDone,
+
+		readAckCount:  0,
+		writeAckCount: 0,
+		writeAckChan:  make(chan struct{}, 4),
 	}
 }
 
@@ -109,21 +117,29 @@ func (m *subConn) LocalAddr() net.Addr {
 	}
 	return m.mainConn.LocalAddr()
 }
+func (m *subConn) ackRead() {
+	m.readAckCount += 1
+	if m.readAckCount >= 128 {
+		m.mainConn.writeChan <- mioDataMessage{DataPrefix: []byte{6, m.idBytes[0], m.idBytes[1]}}
+		m.readAckCount -= 128
+	}
+}
 
 // Read implements net.Conn.
 func (m *subConn) Read(b []byte) (n int, err error) {
+	if m.ctx.Err() != nil {
+		return 0, m.ctx.Err()
+	}
+	deadLine := context.Background()
+	if !m.readDeadline.Equal(time.Time{}) {
+		var cancelFunc func()
+		deadLine, cancelFunc = context.WithDeadline(deadLine, m.readDeadline)
+		defer cancelFunc()
+	}
 	for len(m.readBuf) == 0 {
-		if m.ctx.Err() != nil {
-			return 0, m.ctx.Err()
-		}
-		deadLine := m.ctx
-		if !m.readDeadline.Equal(time.Time{}) {
-			timeout, cancelFunc := context.WithDeadline(m.ctx, m.readDeadline)
-			deadLine = timeout
-			defer cancelFunc()
-		}
 		select {
 		case m.readBuf = <-m.readChan:
+			m.ackRead()
 		case <-m.ctx.Done():
 			return 0, m.ctx.Err()
 		case <-deadLine.Done():
@@ -138,13 +154,22 @@ func (m *subConn) Read(b []byte) (n int, err error) {
 
 // Write implements io.WriterTo.
 func (m *subConn) WriteTo(w io.Writer) (n int64, err error) {
+	deadLine := context.Background()
+	if !m.readDeadline.Equal(time.Time{}) {
+		var cancelFunc func()
+		deadLine, cancelFunc = context.WithDeadline(deadLine, m.readDeadline)
+		defer cancelFunc()
+	}
 	var nn int
 	for {
 		if len(m.readBuf) == 0 {
 			select {
 			case m.readBuf = <-m.readChan:
+				m.ackRead()
 			case <-m.ctx.Done():
 				return n, m.ctx.Err()
+			case <-deadLine.Done():
+				return 0, os.ErrDeadlineExceeded
 			}
 		}
 		nn, err = w.Write(m.readBuf)
@@ -162,14 +187,28 @@ func (m *subConn) Write(b []byte) (n int, err error) {
 		return 0, m.ctx.Err()
 	}
 	n = 0
-	deadLine := m.ctx
+	deadLine := context.Background()
 	if !m.writeDeadline.Equal(time.Time{}) {
-		timeout, cancelFunc := context.WithDeadline(m.ctx, m.writeDeadline)
-		deadLine = timeout
+		var cancelFunc func()
+		deadLine, cancelFunc = context.WithDeadline(deadLine, m.writeDeadline)
 		defer cancelFunc()
 	}
 	maxSize := m.mainConn.maxWriteSize
 	for len(b) > n {
+		for len(m.writeAckChan) > 0 {
+			<-m.writeAckChan
+			m.writeAckCount -= 128
+		}
+		if m.mainConn.version >= 2 && (m.writeAckCount >= 1024) {
+			select {
+			case <-m.writeAckChan:
+				m.writeAckCount -= 128
+			case <-m.ctx.Done():
+				return 0, m.ctx.Err()
+			case <-deadLine.Done():
+				return n, os.ErrDeadlineExceeded
+			}
+		}
 		wn := min(len(b)-n, maxSize)
 		lenBytes := binary.BigEndian.AppendUint16([]byte{}, uint16(wn))
 		select {
@@ -181,6 +220,7 @@ func (m *subConn) Write(b []byte) (n int, err error) {
 			msg := <-m.writeReplyChan
 			wn = msg.N
 			err = msg.Err
+			m.writeAckCount += 1
 		case <-m.ctx.Done():
 			return 0, m.ctx.Err()
 		case <-deadLine.Done():

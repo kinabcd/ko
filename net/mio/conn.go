@@ -147,7 +147,7 @@ func (m *conn) handshake() (err error) {
 		}
 	}()
 	// say hello "MIO" (3), Version(1)
-	m.version = 1
+	m.version = 2
 	m.writeAsync([]byte{'M', 'I', 'O', m.version})
 	if bs, err := koIo.ReadN(c, 4); err != nil {
 		return err
@@ -267,6 +267,12 @@ func (m *conn) processNextPack() (err error) {
 		} else {
 			// ping from peer. pong it.
 			m.writeAsync([]byte{5, idBytes[0], idBytes[1]})
+		}
+	} else if t == 6 { // ack
+		m.subConnLock.Lock()
+		defer m.subConnLock.Unlock()
+		if c, ok := m.subConns[id]; ok {
+			c.writeAckChan <- struct{}{}
 		}
 	}
 	return nil
