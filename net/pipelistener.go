@@ -8,13 +8,13 @@ import (
 )
 
 var (
-	_ Listener      = &pipeListener{}
-	_ Dialer        = &pipeListener{}
-	_ ContextDialer = &pipeListener{}
-	_ Forwarder     = &pipeListener{}
+	_ Listener      = &PipeListener{}
+	_ Dialer        = &PipeListener{}
+	_ ContextDialer = &PipeListener{}
+	_ Forwarder     = &PipeListener{}
 )
 
-type pipeListener struct {
+type PipeListener struct {
 	ch    chan net.Conn
 	close chan struct{}
 	done  uint32
@@ -26,8 +26,8 @@ type pipeListener struct {
 // The returned Listener and Dialer operate on the same in-memory channel.
 // Calling Dial on the Dialer will return a Conn that can be used to
 // communicate with a Conn accepted from the Listener.
-func ListenPipe() *pipeListener {
-	pl := &pipeListener{
+func ListenPipe() *PipeListener {
+	pl := &PipeListener{
 		ch:    make(chan net.Conn),
 		close: make(chan struct{}),
 	}
@@ -35,7 +35,7 @@ func ListenPipe() *pipeListener {
 }
 
 // Accept waits for and returns the next connection to the listener.
-func (l *pipeListener) Accept() (c net.Conn, e error) {
+func (l *PipeListener) Accept() (c net.Conn, e error) {
 	select {
 	case c = <-l.ch:
 	case <-l.close:
@@ -46,7 +46,7 @@ func (l *pipeListener) Accept() (c net.Conn, e error) {
 
 // Close closes the listener.
 // Any blocked Accept operations will be unblocked and return errors.
-func (l *pipeListener) Close() (e error) {
+func (l *PipeListener) Close() (e error) {
 	if atomic.LoadUint32(&l.done) == 0 {
 		l.m.Lock()
 		defer l.m.Unlock()
@@ -61,11 +61,11 @@ func (l *pipeListener) Close() (e error) {
 }
 
 // Addr returns the listener's network address.
-func (l *pipeListener) Addr() net.Addr { return pipeAddr{} }
-func (l *pipeListener) Dial(network, addr string) (net.Conn, error) {
+func (l *PipeListener) Addr() net.Addr { return pipeAddr{} }
+func (l *PipeListener) Dial(network, addr string) (net.Conn, error) {
 	return l.DialContext(context.Background(), network, addr)
 }
-func (l *pipeListener) DialContext(ctx context.Context, network, addr string) (conn net.Conn, e error) {
+func (l *PipeListener) DialContext(ctx context.Context, network, addr string) (conn net.Conn, e error) {
 	// check closed
 	if atomic.LoadUint32(&l.done) != 0 {
 		e = net.ErrClosed
@@ -88,7 +88,7 @@ func (l *pipeListener) DialContext(ctx context.Context, network, addr string) (c
 	return
 }
 
-func (l *pipeListener) Forward(ctx context.Context, conn net.Conn) (e error) {
+func (l *PipeListener) Forward(ctx context.Context, conn net.Conn) (e error) {
 	// check closed
 	if atomic.LoadUint32(&l.done) != 0 {
 		e = net.ErrClosed
