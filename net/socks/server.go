@@ -139,7 +139,7 @@ func (srv *Server) serveSOCKS4(ctx context.Context, conn net.Conn) (err error) {
 		return err
 	}
 	srv.logD("Connect", "proto", "SOCKS4", "address", address)
-	if srv.AuthContext != nil {
+	if srv.AuthContext != nil || srv.AuthHandler != nil {
 		return ErrAuthFailed
 	}
 	if srv.ConnContext != nil {
