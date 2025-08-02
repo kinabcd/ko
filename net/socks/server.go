@@ -29,8 +29,19 @@ type Server struct {
 	// If nil, log nothing.
 	Logger *slog.Logger
 
-	// Handle authorization. AuthMethodNotRequired if nil
-	// If AuthHandler is not nil, SOCKS4(a) server will not serve.
+	// AuthContext handles user authentication for a proxy.
+	//
+	// It returns a boolean indicating whether the provided username and password are
+	// valid. If true, a non-nil Context must also be returned, which will be used
+	// for dialing. The original context is passed in via the 'ctx' parameter.
+	//
+	// Authentication is optional. SOCKS4(a) connections are supported only when
+	// both AuthContext and AuthHandler are nil. If AuthContext is set, it takes
+	// precedence over AuthHandler, and SOCKS4(a) connections are not supported.
+	AuthContext func(ctx context.Context, username, password string) (bool, context.Context)
+
+	// AuthHandler authenticates a user based on the provided username and password,
+	// returning true on success. This handler is only used if AuthContext is nil.
 	AuthHandler func(username, password string) bool
 
 	// ConnContext optionally specifies a function that modifies
@@ -128,7 +139,7 @@ func (srv *Server) serveSOCKS4(ctx context.Context, conn net.Conn) (err error) {
 		return err
 	}
 	srv.logD("Connect", "proto", "SOCKS4", "address", address)
-	if srv.AuthHandler != nil {
+	if srv.AuthContext != nil {
 		return ErrAuthFailed
 	}
 	if srv.ConnContext != nil {
@@ -156,7 +167,13 @@ func (srv *Server) serveSOCKS5(ctx context.Context, conn net.Conn) (err error) {
 		err = fmt.Errorf("wrong header: %w", err)
 		return
 	}
-	authRequired := srv.AuthHandler != nil
+	authContext := srv.AuthContext
+	if authContext == nil && srv.AuthHandler != nil {
+		authContext = func(ctx context.Context, username, password string) (bool, context.Context) {
+			return srv.AuthHandler(username, password), ctx
+		}
+	}
+	authRequired := authContext != nil
 	if authRequired && slices.Contains(methods, AuthMethodUsernamePassword) {
 		if err = writeSOCKS5AuthMethod(conn, AuthMethodUsernamePassword); err != nil {
 			return
@@ -165,7 +182,8 @@ func (srv *Server) serveSOCKS5(ctx context.Context, conn net.Conn) (err error) {
 		if account, password, err = readSOCKS5AuthUsernamePassword(conn); err != nil {
 			return
 		}
-		if !srv.AuthHandler(account, password) {
+		var ok bool
+		if ok, ctx = authContext(ctx, account, password); !ok {
 			err = ErrAuthFailed
 			writeSOCKS5AuthResult(conn, false)
 			return

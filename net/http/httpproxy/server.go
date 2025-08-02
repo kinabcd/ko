@@ -1,6 +1,7 @@
 package httpproxy
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"net"
@@ -73,8 +74,17 @@ type Server struct {
 	// If nil, log nothing
 	Logger *slog.Logger
 
-	// Handle authorization. Return true if identify is allowed.
-	// If AuthHandler is nil, Proxy-Authorization is not required.
+	// AuthContext handles user authentication for a proxy.
+	//
+	// It returns a boolean indicating whether the provided username and password are
+	// valid. If true, a non-nil Context must also be returned, which will be used
+	// for dialing. The original context is passed in via the 'ctx' parameter.
+	//
+	// Authentication is optional. If AuthContext is set, it takes precedence over AuthHandler.
+	AuthContext func(ctx context.Context, username, password string) (bool, context.Context)
+
+	// AuthHandler authenticates a user based on the provided username and password,
+	// returning true on success. This handler is only used if AuthContext is nil.
 	AuthHandler func(username, password string) bool
 
 	// Handle proxy request.
@@ -102,10 +112,20 @@ func (p *Server) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 		}
 		return
 	}
-	if p.AuthHandler != nil {
+	authContext := p.AuthContext
+	if authContext == nil && p.AuthHandler != nil {
+		authContext = func(ctx context.Context, username, password string) (bool, context.Context) {
+			return p.AuthHandler(username, password), ctx
+		}
+	}
+	if authContext != nil {
 		pa := req.Header.Get("Proxy-Authorization")
 		pau, pap, ok := koHttp.DecodeBasicAuth(pa)
-		ok = ok && p.AuthHandler(pau, pap)
+		if ok {
+			var ctx context.Context
+			ok, ctx = authContext(req.Context(), pau, pap)
+			req = req.WithContext(ctx)
+		}
 		if !ok {
 			wr.Header().Add("Proxy-Authenticate", "Basic")
 			p.logD("auth failed", slog.String("user", pau), slog.String("pass", pap))
