@@ -1,11 +1,13 @@
 package httpproxy
 
 import (
+	"compress/gzip"
 	"context"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -96,6 +98,11 @@ type Server struct {
 	Fallback http.Handler
 
 	client *http.Client
+
+	// ProxyCompression enables Gzip or Brotli compression on proxied responses.
+	// Set to true to automatically compress responses from the backend server
+	// (e.g., HTML, CSS, JSON) if the client supports it.
+	ProxyCompression bool
 }
 
 func (p *Server) Serve(l net.Listener) error {
@@ -238,7 +245,7 @@ func (p *Server) serveOthers(wr http.ResponseWriter, req *http.Request) {
 
 	resp, err := p.client.Do(req)
 	if err != nil {
-		http.Error(wr, "Server Error", http.StatusInternalServerError)
+		http.Error(wr, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		p.logW(err.Error())
 		return
 	}
@@ -246,9 +253,27 @@ func (p *Server) serveOthers(wr http.ResponseWriter, req *http.Request) {
 
 	delHopHeaders(resp.Header)
 
+	var resBody io.ReadCloser = resp.Body
+	var bodyWriter io.Writer = wr
+
+	isClientTransferChunkAllowed := !(req.ProtoMajor == 1 && req.ProtoMinor == 0)
+	acceptEncoding := strings.Split(strings.Join(req.Header.Values("Accept-Encoding"), ","), ",")
+	for i := range acceptEncoding {
+		acceptEncoding[i] = strings.TrimSpace(acceptEncoding[i])
+	}
+	if p.ProxyCompression && isClientTransferChunkAllowed &&
+		resp.Header.Get("Content-Encoding") == "" && slices.Contains(acceptEncoding, "gzip") {
+		// Client accepts gzip, but server does not send gzip. compress it.
+		resp.Header.Set("Content-Encoding", "gzip")
+		resp.Header.Del("Content-Length")
+		gzipWriter := gzip.NewWriter(wr)
+		defer gzipWriter.Close()
+		bodyWriter = gzipWriter
+	}
+
 	copyHeader(wr.Header(), resp.Header)
 	wr.WriteHeader(resp.StatusCode)
-	io.Copy(wr, resp.Body)
+	io.Copy(bodyWriter, resBody)
 }
 
 func (p *Server) serveConnect(wr http.ResponseWriter, req *http.Request) {
