@@ -69,7 +69,7 @@ func newMioSubConn(ctx context.Context, id uint16, mainConn *conn, localAddr, re
 
 		readAckCount:  0,
 		writeAckCount: 0,
-		writeAckChan:  make(chan struct{}, 4),
+		writeAckChan:  make(chan struct{}, 8),
 	}
 }
 
