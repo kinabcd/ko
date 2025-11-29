@@ -2,6 +2,7 @@ package socks
 
 import (
 	"fmt"
+	"strconv"
 )
 
 var ErrWrongProtocol error = fmt.Errorf("wrong protocol")
@@ -19,13 +20,59 @@ const (
 	AddrTypeFQDN = 0x03
 	AddrTypeIPv6 = 0x04
 
-	CmdConnect byte = 0x01 // establishes an active-open forward proxy connection
+	CmdConnect Command = 0x01 // establishes an active-open forward proxy connection
+	cmdBind    Command = 0x02 // establishes a passive-open forward proxy connection
 
-	AuthMethodNotRequired         byte = 0x00 // no authentication required
-	AuthMethodUsernamePassword    byte = 0x02 // use username/password
-	AuthMethodNoAcceptableMethods byte = 0xff // no acceptable authentication methods
+	AuthMethodNotRequired         AuthMethod = 0x00 // no authentication required
+	AuthMethodUsernamePassword    AuthMethod = 0x02 // use username/password
+	AuthMethodNoAcceptableMethods AuthMethod = 0xff // no acceptable authentication methods
 
-	StatusSucceeded          byte = 0x00
-	StatusFailed             byte = 0x01
-	StatusNetworkUnreachable byte = 0x03
+	StatusSucceeded          Reply = 0x00
+	StatusFailed             Reply = 0x01
+	StatusNetworkUnreachable Reply = 0x03
 )
+
+// A Command represents a SOCKS command.
+type Command int
+
+func (cmd Command) String() string {
+	switch cmd {
+	case CmdConnect:
+		return "socks connect"
+	case cmdBind:
+		return "socks bind"
+	default:
+		return "socks " + strconv.Itoa(int(cmd))
+	}
+}
+
+// A Reply represents a SOCKS command reply code.
+type Reply byte
+
+func (code Reply) String() string {
+	switch code {
+	case StatusSucceeded:
+		return "succeeded"
+	case 0x01:
+		return "general SOCKS server failure"
+	case 0x02:
+		return "connection not allowed by ruleset"
+	case 0x03:
+		return "network unreachable"
+	case 0x04:
+		return "host unreachable"
+	case 0x05:
+		return "connection refused"
+	case 0x06:
+		return "TTL expired"
+	case 0x07:
+		return "command not supported"
+	case 0x08:
+		return "address type not supported"
+	default:
+		return "unknown code: " + strconv.Itoa(int(code))
+	}
+}
+
+// An AuthMethod represents a SOCKS authentication method.
+type AuthMethod byte

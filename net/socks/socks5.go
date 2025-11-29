@@ -9,7 +9,7 @@ import (
 	koIo "github.com/kinabcd/ko/io"
 )
 
-func readSOCKS5Header(conn net.Conn) (method []byte, err error) {
+func readSOCKS5Header(conn net.Conn) (methods []AuthMethod, err error) {
 	/**
 	  +-----+------+-----------+
 	  | VER | SIZE |  METHODS  |
@@ -20,12 +20,18 @@ func readSOCKS5Header(conn net.Conn) (method []byte, err error) {
 	var size byte
 	if size, err = koIo.ReadByte(conn); err != nil {
 		return nil, ErrWrongProtocol
+	} else if methodBytes, err := koIo.ReadN(conn, int(size)); err != nil {
+		return nil, err
 	} else {
-		return koIo.ReadN(conn, int(size))
+		methods = make([]AuthMethod, len(methodBytes))
+		for i, b := range methodBytes {
+			methods[i] = AuthMethod(b)
+		}
+		return methods, nil
 	}
 }
 
-func writeSOCKS5AuthMethod(conn net.Conn, method byte) (err error) {
+func writeSOCKS5AuthMethod(conn net.Conn, method AuthMethod) (err error) {
 	/**
 	  +-----+--------+
 	  | VER | METHOD |
@@ -33,7 +39,7 @@ func writeSOCKS5AuthMethod(conn net.Conn, method byte) (err error) {
 	  | '5' |   1    |
 	  +-----+--------+
 	*/
-	_, err = conn.Write([]byte{Version5, method})
+	_, err = conn.Write([]byte{Version5, byte(method)})
 	return
 }
 
@@ -69,7 +75,7 @@ func writeSOCKS5AuthResult(conn net.Conn, ok bool) (err error) {
 	if !ok {
 		status = StatusFailed
 	}
-	_, err = conn.Write([]byte{0x01, status})
+	_, err = conn.Write([]byte{0x01, byte(status)})
 	return
 }
 
@@ -86,7 +92,7 @@ func readSOCKS5Request(conn net.Conn) (address string, err error) {
 		err = fmt.Errorf("read header failed: %w", err)
 		return
 	}
-	cmd := bs[1]
+	cmd := Command(bs[1])
 	addressType := bs[3]
 	if cmd != CmdConnect {
 		err = ErrCmdNotSupported
@@ -98,13 +104,14 @@ func readSOCKS5Request(conn net.Conn) (address string, err error) {
 func readSOCKS5Addr(conn net.Conn, addressType byte) (address string, err error) {
 	var bs []byte
 	var host string
-	if addressType == AddrTypeIPv4 {
+	switch addressType {
+	case AddrTypeIPv4:
 		bs, err = koIo.ReadN(conn, 4)
-	} else if addressType == AddrTypeIPv6 {
+	case AddrTypeIPv6:
 		bs, err = koIo.ReadN(conn, 16)
-	} else if addressType == AddrTypeFQDN {
+	case AddrTypeFQDN:
 		host, err = koIo.ReadPascalString(conn)
-	} else {
+	default:
 		err = ErrWrongFormat
 	}
 	if err != nil {
@@ -129,7 +136,7 @@ func readSOCKS5Addr(conn net.Conn, addressType byte) (address string, err error)
 	return
 }
 
-func writeSOCKS5Response(conn net.Conn, status byte) error {
+func writeSOCKS5Response(conn net.Conn, status Reply) error {
 	/**
 	  +-----+--------+-----+----------+----------+----------+
 	  | VER | STATUS | RSV | BND.TYPE | BND.ADDR | BND.PORT |
@@ -137,6 +144,6 @@ func writeSOCKS5Response(conn net.Conn, status byte) error {
 	  | '5' |   1    | '0' |    1     | Variable |    2     |
 	  +-----+--------+-----+----------+----------+----------+
 	*/
-	_, err := conn.Write([]byte{Version5, status, 0x00, AddrTypeIPv4, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
+	_, err := conn.Write([]byte{Version5, byte(status), 0x00, AddrTypeIPv4, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
 	return err
 }

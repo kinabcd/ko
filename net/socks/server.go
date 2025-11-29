@@ -162,7 +162,7 @@ func (srv *Server) serveSOCKS4(ctx context.Context, conn net.Conn) (err error) {
 }
 
 func (srv *Server) serveSOCKS5(ctx context.Context, conn net.Conn) (err error) {
-	var methods []byte
+	var methods []AuthMethod
 	if methods, err = readSOCKS5Header(conn); err != nil {
 		err = fmt.Errorf("wrong header: %w", err)
 		return
