@@ -18,7 +18,8 @@ func TestSock5NoAuth(t *testing.T) {
 	lp := koNet.ListenPipe()
 	go s.Serve(lp)
 	c, _ := lp.Dial("", "")
-	c, err := socks.SOCKS5Client(context.Background(), c, "tcp", "example.tw:9999", nil)
+	client := &socks.Client{Dialer: lp}
+	_, err := client.DialWithConn(context.Background(), c, "tcp", "example.tw:9999")
 	koTesting.AssertNoError(t, err)
 	outContent := []byte("YOYOYO")
 	c.Write(outContent[:3])

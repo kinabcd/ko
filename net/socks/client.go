@@ -2,19 +2,20 @@ package socks
 
 import (
 	"context"
-	"crypto/tls"
-	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
 	"net/url"
-	"slices"
 	"strconv"
+	"time"
 
-	koIo "github.com/kinabcd/ko/io"
 	koNet "github.com/kinabcd/ko/net"
 )
 
+// A Client holds SOCKS-specific options.
 type Client struct {
+	Cmd Command // either CmdConnect or cmdBind
+
 	ProxyUrl *url.URL
 
 	// Dialer specifies an optional dial function with context for
@@ -24,106 +25,147 @@ type Client struct {
 	Dialer koNet.ContextDialer
 }
 
-func (s *Client) DialContext(ctx context.Context, network, addr string) (conn net.Conn, err error) {
-	dialer := s.Dialer
-	if dialer == nil {
-		dialer = &net.Dialer{}
-	}
-	if s.ProxyUrl == nil {
-		err = errors.New("proxy url not set")
-		return
-	}
-	if slices.Contains([]string{"socks5h", "socks5", "socks5+tls"}, s.ProxyUrl.Scheme) {
-		if conn, err = dialer.DialContext(ctx, "tcp", s.ProxyUrl.Host); err != nil {
-			return
-		}
-		if s.ProxyUrl.Scheme == "socks5+tls" {
-			conn = tls.Client(conn, &tls.Config{
-				ServerName:         s.ProxyUrl.Hostname(),
-				InsecureSkipVerify: s.ProxyUrl.Query().Has("insecure"),
-			})
-		}
-		return SOCKS5Client(ctx, conn, network, addr, s.ProxyUrl.User)
-	}
-
-	err = errors.New("unknown scheme " + s.ProxyUrl.Scheme)
-	return
-}
-
-func SOCKS5Client(ctx context.Context, conn net.Conn, network, addr string, user *url.Userinfo) (net.Conn, error) {
-	e := func(err error) (net.Conn, error) {
-		conn.Close()
+// DialContext connects to the provided address on the provided
+// network.
+//
+// The returned error value may be a net.OpError. When the Op field of
+// net.OpError contains "socks", the Source field contains a proxy
+// server address and the Addr field contains a command target
+// address.
+//
+// See func Dial of the net package of standard library for a
+// description of the network and address parameters.
+func (d *Client) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	d.fillDefault()
+	if err := d.validateParams(ctx, network, address); err != nil {
 		return nil, err
 	}
-	var err error
-	var host, port string
-	if host, port, err = net.SplitHostPort(addr); err != nil {
+	if d.ProxyUrl.Host == "" {
+		return nil, errors.New("invalid ProxyUrl " + d.ProxyUrl.String())
+	}
+	c, err := d.Dialer.DialContext(ctx, "tcp", d.ProxyUrl.Host)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect proxy server %s: %w"+d.ProxyUrl.String(), err)
+	}
+	a, err := d.connect(ctx, c, address)
+	if err != nil {
+		return nil, d.newOpError(network, address, err)
+	}
+	return &koNet.OverrideConn{Conn: c, OverrideLocalAddr: a}, nil
+}
+
+// DialWithConn initiates a connection from SOCKS server to the target
+// network and address using the connection c that is already
+// connected to the SOCKS server.
+//
+// It returns the connection's local address assigned by the SOCKS
+// server.
+func (d *Client) DialWithConn(ctx context.Context, c net.Conn, network, address string) (net.Addr, error) {
+	d.fillDefault()
+	if err := d.validateParams(ctx, network, address); err != nil {
+		return nil, err
+	}
+	a, err := d.connect(ctx, c, address)
+	if err != nil {
+		return nil, d.newOpError(network, address, err)
+	}
+	return a, err
+}
+
+func (d *Client) newOpError(network, address string, err error) error {
+	proxy := &koNet.OverrideAddr{OverrideNetwork: d.ProxyUrl.Scheme, OverrideAddress: d.ProxyUrl.Host}
+	dst := &koNet.OverrideAddr{OverrideNetwork: network, OverrideAddress: address}
+	return &net.OpError{Op: d.Cmd.String(), Net: network, Source: proxy, Addr: dst, Err: err}
+}
+func (d *Client) fillDefault() {
+	if d.Cmd == CmdUnset {
+		d.Cmd = CmdConnect
+	}
+	if d.Dialer == nil {
+		d.Dialer = &net.Dialer{}
+	}
+	if d.ProxyUrl == nil {
+		d.ProxyUrl = &url.URL{}
+	}
+}
+func (d *Client) validateParams(ctx context.Context, network, address string) error {
+	if ctx == nil {
+		return errors.New("nil context")
+	}
+	switch network {
+	case "tcp", "tcp6", "tcp4":
+	default:
+		return errors.New("network not implemented")
+	}
+	switch d.Cmd {
+	case CmdConnect, cmdBind:
+	default:
+		return errors.New("command not implemented")
+	}
+	return nil
+}
+
+func (d *Client) connect(ctx context.Context, c net.Conn, address string) (net.Addr, error) {
+	e := func(err error) (net.Addr, error) {
+		c.Close()
+		return nil, err
+	}
+	var user *url.Userinfo = d.ProxyUrl.User
+	if deadline, ok := ctx.Deadline(); ok && !deadline.IsZero() {
+		c.SetDeadline(deadline)
+		defer c.SetDeadline(time.Time{})
+	}
+	if ctx != context.Background() {
+		done := make(chan struct{})
+		defer close(done)
+		go func() {
+			select {
+			case <-ctx.Done():
+				c.Close()
+			case <-done:
+			}
+		}()
+	}
+
+	ams := []AuthMethod{AuthMethodNotRequired}
+	if user != nil {
+		ams = append(ams, AuthMethodUsernamePassword)
+	}
+	if err := writeSOCKS5Header(c, ams); err != nil {
 		return e(err)
 	}
-	var portInt uint64
-	if portInt, err = strconv.ParseUint(port, 10, 16); err != nil {
+
+	if am, err := readSOCKS5AuthMethod(c); err != nil {
 		return e(err)
-	}
-	portByte := []byte{0, 0}
-	binary.BigEndian.PutUint16(portByte, uint16(portInt))
-	hasAuth := user != nil
-	done := make(chan struct{})
-	defer close(done)
-	go func() {
-		select {
-		case <-ctx.Done():
-			conn.Close()
-		case <-done:
+	} else if am == AuthMethodNoAcceptableMethods {
+		return e(errors.New("no acceptable authentication methods"))
+	} else if am == AuthMethodUsernamePassword {
+		if user == nil {
+			return e(errors.New("unexpected authentication username/password"))
 		}
-	}()
-	header := []byte{Version5, 1, AuthMethodNotRequired}
-	if hasAuth {
-		header = []byte{Version5, 2, AuthMethodNotRequired, AuthMethodUsernamePassword}
-	}
-	if _, err = conn.Write(header); err != nil {
-		return e(err)
-	}
-	var resB []byte
-	if resB, err = koIo.ReadN(conn, 2); err != nil {
-		return e(err)
-	} else if resB[0] != Version5 {
-		return e(ErrWrongProtocol)
-	}
-	if resB[1] != AuthMethodNotRequired {
-		if resB[1] == AuthMethodUsernamePassword {
-			username := user.Username()
-			password, _ := user.Password()
-			_, _ = conn.Write([]byte{1})
-			_ = koIo.WritePascalString(conn, username)
-			if err = koIo.WritePascalString(conn, password); err != nil {
-				return e(err)
-			}
-			if resB, err = koIo.ReadN(conn, 2); err != nil {
-				return e(err)
-			}
-			if resB[1] != StatusSucceeded {
-				return e(ErrAuthFailed)
-			}
-		} else {
-			return e(ErrAuthMethodNotSupported)
+
+		username := user.Username()
+		password, _ := user.Password()
+		if err := writeSOCKS5AuthUsernamePassword(c, username, password); err != nil {
+			return e(err)
 		}
+		if err := readSOCKS5AuthResult(c); err != nil {
+			return e(err)
+		}
+	} else if am != AuthMethodNotRequired {
+		return e(errors.New("unsupported authentication method " + strconv.Itoa(int(am))))
 	}
 
-	conn.Write([]byte{Version5, CmdConnect, 0, AddrTypeFQDN})
-	koIo.WritePascalString(conn, host)
-	if _, err = conn.Write(portByte); err != nil {
+	if err := writeSOCKS5Request(c, d.Cmd, address); err != nil {
 		return e(err)
 	}
 
-	if resB, err = koIo.ReadN(conn, 4); err != nil {
+	resAddress, err := readSOCKS5Response(c)
+	if err != nil {
 		return e(err)
 	}
-	if resB[1] != StatusSucceeded {
-		return e(errors.New("connect failed, status " + string(resB[1])))
-	}
-	if _, err = readSOCKS5Addr(conn, resB[3]); err != nil {
-		return e(err)
-	}
-
-	return conn, nil
+	return &koNet.OverrideAddr{
+		OverrideNetwork: "socks",
+		OverrideAddress: resAddress,
+	}, nil
 }

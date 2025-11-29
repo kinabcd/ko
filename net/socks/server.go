@@ -162,7 +162,7 @@ func (srv *Server) serveSOCKS4(ctx context.Context, conn net.Conn) (err error) {
 }
 
 func (srv *Server) serveSOCKS5(ctx context.Context, conn net.Conn) (err error) {
-	var methods []byte
+	var methods []AuthMethod
 	if methods, err = readSOCKS5Header(conn); err != nil {
 		err = fmt.Errorf("wrong header: %w", err)
 		return
@@ -213,12 +213,12 @@ func (srv *Server) serveSOCKS5(ctx context.Context, conn net.Conn) (err error) {
 	}
 	var outConn net.Conn
 	if outConn, err = srv.getDialer().DialContext(ctx, "tcp", address); err != nil {
-		writeSOCKS5Response(conn, StatusNetworkUnreachable)
+		writeSOCKS5Response(conn, StatusNetworkUnreachable, "0.0.0.0:65535")
 		err = fmt.Errorf("dial failed: %w", err)
 		return
 	}
 	defer outConn.Close()
-	if err = writeSOCKS5Response(conn, StatusSucceeded); err != nil {
+	if err = writeSOCKS5Response(conn, StatusSucceeded, "0.0.0.0:65535"); err != nil {
 		err = fmt.Errorf("response failed: %w", err)
 		return
 	}
