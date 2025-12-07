@@ -6,7 +6,6 @@ import (
 	"errors"
 	"io"
 	"net"
-	"net/url"
 	"os"
 	"time"
 )
@@ -29,8 +28,6 @@ type subConn struct {
 
 	readChan chan []byte
 	readBuf  []byte
-
-	writeReplyChan chan mioDataMessage
 
 	dialing     context.Context
 	dialingDone func()
@@ -61,8 +58,7 @@ func newMioSubConn(ctx context.Context, id uint16, mainConn *conn, localAddr, re
 		ctx:   baseContext,
 		close: cancelFunc,
 
-		readChan:       make(chan []byte, 1024),
-		writeReplyChan: make(chan mioDataMessage),
+		readChan: make(chan []byte, 1024),
 
 		dialing:     dialing,
 		dialingDone: dialingDone,
@@ -73,27 +69,6 @@ func newMioSubConn(ctx context.Context, id uint16, mainConn *conn, localAddr, re
 	}
 }
 
-func (m *subConn) dial(ctx context.Context) (e error) {
-	if m.mainConn.version >= 1 {
-		u := url.URL{Scheme: m.remoteAddr.Network(), Host: m.remoteAddr.String()}
-		bs := append([]byte{1, m.idBytes[0], m.idBytes[1]}, []byte(u.String())...)
-		bs = append(bs, 0)
-		m.mainConn.writeAsync(bs)
-	} else {
-		m.mainConn.writeAsync([]byte{1, m.idBytes[0], m.idBytes[1]})
-	}
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-m.dialing.Done():
-		return m.ctx.Err()
-	}
-}
-
-func (m *subConn) accept() (e error) {
-	m.mainConn.writeAsync([]byte{2, m.idBytes[0], m.idBytes[1]})
-	return
-}
 func (m *subConn) Id() uint16 {
 	return m.id
 }
@@ -106,7 +81,7 @@ func (m *subConn) Close() (e error) {
 func (m *subConn) CloseCause(cause error) (e error) {
 	m.mainConn.clearSubConn(m)
 	m.close(cause)
-	m.mainConn.writeAsync([]byte{3, m.idBytes[0], m.idBytes[1]})
+	m.mainConn.writePack(CLOSE, m.id)
 	return
 }
 
@@ -120,7 +95,7 @@ func (m *subConn) LocalAddr() net.Addr {
 func (m *subConn) ackRead() {
 	m.readAckCount += 1
 	if m.readAckCount >= 128 {
-		m.mainConn.writeChan <- mioDataMessage{DataPrefix: []byte{6, m.idBytes[0], m.idBytes[1]}}
+		m.mainConn.writePack(ACK, m.id)
 		m.readAckCount -= 128
 	}
 }
@@ -187,44 +162,26 @@ func (m *subConn) Write(b []byte) (n int, err error) {
 		return 0, m.ctx.Err()
 	}
 	n = 0
-	deadLine := context.Background()
+	ctx := m.ctx
 	if !m.writeDeadline.Equal(time.Time{}) {
 		var cancelFunc func()
-		deadLine, cancelFunc = context.WithDeadline(deadLine, m.writeDeadline)
+		ctx, cancelFunc = context.WithDeadline(m.ctx, m.writeDeadline)
 		defer cancelFunc()
 	}
 	maxSize := m.mainConn.maxWriteSize
 	for len(b) > n {
-		for len(m.writeAckChan) > 0 {
-			<-m.writeAckChan
-			m.writeAckCount -= 128
-		}
+		m.applyWriteAck()
 		if m.mainConn.version >= 2 && (m.writeAckCount >= 1024) {
 			select {
 			case <-m.writeAckChan:
 				m.writeAckCount -= 128
-			case <-m.ctx.Done():
-				return 0, m.ctx.Err()
-			case <-deadLine.Done():
-				return n, os.ErrDeadlineExceeded
+			case <-ctx.Done():
+				return n, ctx.Err()
 			}
 		}
 		wn := min(len(b)-n, maxSize)
-		lenBytes := binary.BigEndian.AppendUint16([]byte{}, uint16(wn))
-		select {
-		case m.mainConn.writeChan <- mioDataMessage{
-			[]byte{4, m.idBytes[0], m.idBytes[1], lenBytes[0], lenBytes[1]}, b[n : n+wn],
-			0, nil,
-			m.writeReplyChan,
-		}:
-			msg := <-m.writeReplyChan
-			wn = msg.N
-			err = msg.Err
+		if wn, err = m.mainConn.writeData(ctx, m.id, b[n:n+wn]); err == nil {
 			m.writeAckCount += 1
-		case <-m.ctx.Done():
-			return 0, m.ctx.Err()
-		case <-deadLine.Done():
-			return n, os.ErrDeadlineExceeded
 		}
 
 		n += wn
@@ -233,6 +190,17 @@ func (m *subConn) Write(b []byte) (n int, err error) {
 		}
 	}
 	return
+}
+
+func (m *subConn) applyWriteAck() {
+	for {
+		select {
+		case <-m.writeAckChan:
+			m.writeAckCount -= 128
+		default:
+			return
+		}
+	}
 }
 
 // RemoteAddr implements net.Conn.

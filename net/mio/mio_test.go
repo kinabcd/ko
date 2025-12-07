@@ -4,15 +4,15 @@ import (
 	"context"
 	"io"
 	"net"
+	"sync"
 	"testing"
 
 	"github.com/kinabcd/ko/net/mio"
-	koSync "github.com/kinabcd/ko/sync"
 	koTesting "github.com/kinabcd/ko/testing"
 )
 
 func TestHandleNewConn(t *testing.T) {
-	wg := &koSync.WaitGroup{}
+	wg := &sync.WaitGroup{}
 	c1, c2 := net.Pipe()
 	b11 := make([]byte, 6)
 	b12 := make([]byte, 6)
@@ -20,33 +20,31 @@ func TestHandleNewConn(t *testing.T) {
 	b22 := make([]byte, 6)
 	cc1 := mio.New(c1)
 	cc2 := mio.New(c2)
-	wg.Go(
-		func() {
-			c11, err1 := cc1.DialContext(context.Background(), "", "")
-			koTesting.AssertNoError(t, err1)
-			c11.Read(b11)
-			c11.Write([]byte{2, 2, 2})
-			c11.Write([]byte{2, 2, 2})
-		},
-		func() {
-			c12, err2 := cc1.Accept()
-			koTesting.AssertNoError(t, err2)
-			c12.Read(b12)
-			c12.Write([]byte{4, 4, 4, 4, 4, 4})
-		},
-		func() {
-			c21, err1 := cc2.Accept()
-			koTesting.AssertNoError(t, err1)
-			c21.Write([]byte{1, 1, 1, 1, 1, 1})
-			io.ReadFull(c21, b21)
-		},
-		func() {
-			c22, err2 := cc2.DialContext(context.Background(), "", "")
-			koTesting.AssertNoError(t, err2)
-			c22.Write([]byte{3, 3, 3, 3, 3, 3})
-			c22.Read(b22)
-		},
-	)
+	wg.Go(func() {
+		c11, err1 := cc1.DialContext(context.Background(), "", "")
+		koTesting.AssertNoError(t, err1)
+		c11.Read(b11)
+		c11.Write([]byte{2, 2, 2})
+		c11.Write([]byte{2, 2, 2})
+	})
+	wg.Go(func() {
+		c12, err2 := cc1.Accept()
+		koTesting.AssertNoError(t, err2)
+		c12.Read(b12)
+		c12.Write([]byte{4, 4, 4, 4, 4, 4})
+	})
+	wg.Go(func() {
+		c21, err1 := cc2.Accept()
+		koTesting.AssertNoError(t, err1)
+		c21.Write([]byte{1, 1, 1, 1, 1, 1})
+		io.ReadFull(c21, b21)
+	})
+	wg.Go(func() {
+		c22, err2 := cc2.DialContext(context.Background(), "", "")
+		koTesting.AssertNoError(t, err2)
+		c22.Write([]byte{3, 3, 3, 3, 3, 3})
+		c22.Read(b22)
+	})
 	wg.Wait()
 	koTesting.AssertSliceEquals(t, []byte{1, 1, 1, 1, 1, 1}, b11)
 	koTesting.AssertSliceEquals(t, []byte{2, 2, 2, 2, 2, 2}, b21)
@@ -54,43 +52,41 @@ func TestHandleNewConn(t *testing.T) {
 	koTesting.AssertSliceEquals(t, []byte{4, 4, 4, 4, 4, 4}, b22)
 }
 func TestBlockSubConn(t *testing.T) {
-	wg := &koSync.WaitGroup{}
+	wg := &sync.WaitGroup{}
 	c1, c2 := net.Pipe()
 	cc1 := mio.New(c1)
 	cc2 := mio.New(c2)
 	done := make(chan int, 4)
-	wg.Go(
-		func() {
-			c11, err1 := cc1.DialContext(context.Background(), "", "")
-			koTesting.AssertNoError(t, err1)
-			for i := 0; i < 2000; i += 1 {
-				c11.Write([]byte{2, 2, 2})
-			}
-			done <- 1
-		},
-		func() {
-			b22 := make([]byte, 3)
-			c12, err2 := cc2.Accept()
-			koTesting.AssertNoError(t, err2)
-			c21, err1 := cc2.DialContext(context.Background(), "", "")
-			koTesting.AssertNoError(t, err1)
-			for i := 0; i < 10000; i += 1 {
-				c21.Write([]byte{2, 2, 2})
-			}
-			done <- 2
-			for i := 0; i < 2000; i += 1 {
-				c12.Read(b22)
-			}
-		},
-		func() {
-			b22 := make([]byte, 3)
-			c22, err2 := cc1.Accept()
-			koTesting.AssertNoError(t, err2)
-			for i := 0; i < 10000; i += 1 {
-				c22.Read(b22)
-			}
-		},
-	)
+	wg.Go(func() {
+		c11, err1 := cc1.DialContext(context.Background(), "", "")
+		koTesting.AssertNoError(t, err1)
+		for i := 0; i < 2000; i += 1 {
+			c11.Write([]byte{2, 2, 2})
+		}
+		done <- 1
+	})
+	wg.Go(func() {
+		b22 := make([]byte, 3)
+		c12, err2 := cc2.Accept()
+		koTesting.AssertNoError(t, err2)
+		c21, err1 := cc2.DialContext(context.Background(), "", "")
+		koTesting.AssertNoError(t, err1)
+		for i := 0; i < 10000; i += 1 {
+			c21.Write([]byte{2, 2, 2})
+		}
+		done <- 2
+		for i := 0; i < 2000; i += 1 {
+			c12.Read(b22)
+		}
+	})
+	wg.Go(func() {
+		b22 := make([]byte, 3)
+		c22, err2 := cc1.Accept()
+		koTesting.AssertNoError(t, err2)
+		for i := 0; i < 10000; i += 1 {
+			c22.Read(b22)
+		}
+	})
 	wg.Wait()
 	result := []int{0, 0}
 	for i := range result {

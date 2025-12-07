@@ -19,6 +19,18 @@ var (
 	_ Conn                = &conn{}
 )
 
+type PackType byte
+
+const (
+	NOOP   PackType = 0
+	DIAL   PackType = 1
+	ACCEPT PackType = 2
+	CLOSE  PackType = 3
+	DATA   PackType = 4
+	PING   PackType = 5
+	ACK    PackType = 6
+)
+
 type conn struct {
 	maxWriteSize int
 	pingInterval time.Duration
@@ -27,15 +39,13 @@ type conn struct {
 	conn       net.Conn
 	acceptChan chan *subConn
 
-	statusLock sync.Mutex
-	isMain     bool
-	ctx        context.Context
-	close      func()
+	isMain bool
+	ctx    context.Context
+	close  func()
 
-	handshakeContext context.Context
-	handshakeDone    func()
+	handshake sync.Once
 
-	writeChan chan mioDataMessage
+	writeChan chan *writeMsg
 
 	subConnLock sync.Mutex
 	subIdNext   uint16
@@ -51,20 +61,16 @@ type conn struct {
 
 func New(c net.Conn, options ...any) (m *conn) {
 	baseContext, cancel := context.WithCancel(context.Background())
-	handshakeContext, handshakeDone := context.WithCancel(baseContext)
 	m = &conn{
 		conn:     c,
 		subConns: make(map[uint16]*subConn),
 		pings:    make(map[uint16]chan struct{}),
 
 		acceptChan: make(chan *subConn, 256),
-		writeChan:  make(chan mioDataMessage, 1024),
+		writeChan:  make(chan *writeMsg, 1024),
 
 		ctx:   baseContext,
 		close: cancel,
-
-		handshakeContext: handshakeContext,
-		handshakeDone:    handshakeDone,
 
 		maxWriteSize: 65535,
 		pingInterval: 15 * time.Second,
@@ -82,10 +88,7 @@ func New(c net.Conn, options ...any) (m *conn) {
 	return
 }
 func (m *conn) Done() <-chan struct{} {
-	if m.handshakeContext.Err() == nil {
-		go m.handshake()
-		<-m.handshakeContext.Done()
-	}
+	m.makesureHandshake()
 	return m.ctx.Done()
 }
 func (m *conn) SubConns() map[uint16]SubConn {
@@ -97,106 +100,125 @@ func (m *conn) SubConns() map[uint16]SubConn {
 	}
 	return r
 }
-func (m *conn) handshake() (err error) {
-	m.statusLock.Lock()
-	defer m.statusLock.Unlock()
-	if m.ctx.Err() != nil {
-		return net.ErrClosed
-	}
-	if m.handshakeContext.Err() != nil {
-		return nil
-	}
-	defer m.handshakeDone()
-	c := m.conn
-	go func() {
-		pingTick := time.Tick(m.pingInterval)
-		if pingTick == nil {
-			pingTick = make(<-chan time.Time) // never trigger
+func (m *conn) makesureHandshake() {
+	m.handshake.Do(func() {
+		rawWriteChan := make(chan []byte, 1)
+		done := make(chan struct{})
+		go m.loopWrite(rawWriteChan)
+		go m.loopRead(rawWriteChan, done)
+		select {
+		case <-done:
+		case <-m.ctx.Done():
+			return
 		}
-		for {
-			select {
-			case <-pingTick:
-				if m.handshakeContext.Err() != nil {
-					go m.testLatency()
-				}
-			case msg := <-m.writeChan:
-				m.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-				_, msg.Err = m.conn.Write(msg.DataPrefix)
-				if msg.Err != nil {
-					msg.N = 0
-					if msg.ReplyTo != nil {
-						msg.ReplyTo <- msg
-					}
-					m.Close()
-					return
-				}
 
-				m.conn.SetWriteDeadline(time.Now().Add(60 * time.Second))
-				msg.N, msg.Err = m.conn.Write(msg.Data)
-				if msg.ReplyTo != nil {
-					msg.ReplyTo <- msg
+		if m.pingInterval > 0 {
+			go m.testLatency()
+		}
+	})
+}
+func (m *conn) loopWrite(rawWriteChan chan []byte) {
+	for b := range rawWriteChan {
+		if _, err := m.conn.Write(b); err != nil {
+			m.Close()
+			return
+		}
+	}
+	// handshake done
+	rawWriteChan = nil
+
+	// normal loop
+	header := make([]byte, 5)
+	pingTick := time.Tick(m.pingInterval)
+	if pingTick == nil {
+		pingTick = make(<-chan time.Time) // never trigger
+	}
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+		case <-pingTick:
+			go m.testLatency()
+		case msg := <-m.writeChan:
+			m.conn.SetWriteDeadline(time.Now().Add(60 * time.Second))
+			header[0] = byte(msg.Type)
+			binary.BigEndian.PutUint16(header[1:3], msg.ID)
+			r := writeResult{}
+			switch msg.Type {
+			case DIAL:
+				r.N, r.Error = m.conn.Write(append(append(header[:3], msg.Data...), 0))
+			case DATA:
+				binary.BigEndian.PutUint16(header[3:5], uint16(len(msg.Data)))
+				_, r.Error = m.conn.Write(header[:5])
+				if r.Error == nil {
+					r.N, r.Error = m.conn.Write(msg.Data)
 				}
-				if msg.Err != nil {
-					m.Close()
-					return
-				}
-			case <-m.ctx.Done():
-				return
+			default:
+				r.N, r.Error = m.conn.Write(header[:3])
 			}
 
+			if msg.ReplyTo != nil {
+				msg.ReplyTo <- r
+			}
+			msgPool.Put(msg.Reset())
+			if r.Error != nil {
+				m.Close()
+				return
+			}
 		}
-	}()
-	// say hello "MIO" (3), Version(1)
+
+	}
+}
+
+func (m *conn) loopRead(rawWriteChan chan []byte, handshakeDoneChan chan struct{}) {
 	m.version = 2
-	m.writeAsync([]byte{'M', 'I', 'O', m.version})
-	if bs, err := koIo.ReadN(c, 4); err != nil {
-		return err
+	// say hello "MIO" (3), Version(1)
+	rawWriteChan <- []byte{'M', 'I', 'O', m.version}
+	if bs, err := koIo.ReadN(m.conn, 4); err != nil {
+		m.Close()
+		return
 	} else {
 		if m.version > bs[3] {
 			m.version = bs[3]
 		}
 	}
+	// high card. winner is main.
 	for {
-		// high card. winner is main.
 		myNum := rand.N(byte(0xFF))
-		peerNum := byte(0)
+		rawWriteChan <- []byte{myNum}
+		if peerNum, err := koIo.ReadByte(m.conn); err != nil {
+			m.Close()
+			return
+		} else if myNum != peerNum {
+			m.isMain = myNum > peerNum
+			break
+		}
+	}
 
-		m.writeAsync([]byte{myNum})
-		if peerNum, err = koIo.ReadByte(c); err != nil {
+	// handshake done. release temp chan
+	close(handshakeDoneChan)
+	close(rawWriteChan)
+	handshakeDoneChan = nil
+	rawWriteChan = nil
+
+	// normal loop
+	for {
+		if err := m.processNextPack(); err != nil {
+			m.Close()
 			return
 		}
-		if myNum == peerNum {
-			// Same. Try again.
-			continue
-		}
-		m.isMain = myNum > peerNum
-		go func() {
-			for {
-				if err := m.processNextPack(); err != nil {
-					m.Close()
-					return
-				}
-			}
-		}()
-
-		if m.pingInterval > 0 {
-			go m.testLatency()
-		}
-		return
 	}
 }
 func (m *conn) processNextPack() (err error) {
-	var t byte
-	if t, err = koIo.ReadByte(m.conn); err != nil {
+	var b []byte
+	if b, err = koIo.ReadN(m.conn, 3); err != nil {
 		return
 	}
-	var idBytes []byte
-	if idBytes, err = koIo.ReadN(m.conn, 2); err != nil {
-		return
-	}
-	id := binary.BigEndian.Uint16(idBytes)
-	if t == 0 {
-	} else if t == 1 { // Dial
+	packType := PackType(b[0])
+	id := binary.BigEndian.Uint16(b[1:3])
+	switch packType {
+	case NOOP:
+	case DIAL:
 		m.subConnLock.Lock()
 		defer m.subConnLock.Unlock()
 		var localAddr net.Addr
@@ -216,21 +238,21 @@ func (m *conn) processNextPack() (err error) {
 		default:
 			go c.CloseCause(ErrDialingIsCanceled)
 		}
-	} else if t == 2 { // Accept
+	case ACCEPT:
 		m.subConnLock.Lock()
 		defer m.subConnLock.Unlock()
 		if c, ok := m.subConns[id]; !ok {
-			m.writeAsync([]byte{3, idBytes[0], idBytes[1]})
+			m.writePack(CLOSE, id)
 		} else {
 			c.dialingDone()
 		}
-	} else if t == 3 { // Close
+	case CLOSE:
 		m.subConnLock.Lock()
 		defer m.subConnLock.Unlock()
 		if c, ok := m.subConns[id]; ok {
 			go c.CloseCause(ErrClosedByRemote)
 		}
-	} else if t == 4 { // Data
+	case DATA:
 		var lenBytes []byte
 		if lenBytes, err = koIo.ReadN(m.conn, 2); err != nil {
 			return
@@ -253,7 +275,7 @@ func (m *conn) processNextPack() (err error) {
 			}
 
 		}
-	} else if t == 5 { // Ping
+	case PING:
 		if (m.isMain && id < 0x8000) || (!m.isMain && id >= 0x8000) {
 			// pong from peer. record the time.
 			m.pingLock.Lock()
@@ -266,9 +288,9 @@ func (m *conn) processNextPack() (err error) {
 			m.pingLock.Unlock()
 		} else {
 			// ping from peer. pong it.
-			m.writeAsync([]byte{5, idBytes[0], idBytes[1]})
+			m.writePack(PING, id)
 		}
-	} else if t == 6 { // ack
+	case ACK:
 		m.subConnLock.Lock()
 		defer m.subConnLock.Unlock()
 		if c, ok := m.subConns[id]; ok {
@@ -307,9 +329,8 @@ func (m *conn) ping() (time.Duration, error) {
 		m.pingLock.Unlock()
 	}()
 
-	idBytes := binary.BigEndian.AppendUint16([]byte{}, n)
 	startTime := time.Now()
-	m.writeAsync([]byte{5, idBytes[0], idBytes[1]})
+	m.writePack(PING, n)
 	select {
 	case <-ch:
 	case <-ctx.Done():
@@ -343,17 +364,11 @@ func (m *conn) Accept() (conn net.Conn, e error) {
 	if m.ctx.Err() != nil {
 		return nil, net.ErrClosed
 	}
-	if m.handshakeContext.Err() == nil {
-		go m.handshake()
-		<-m.handshakeContext.Done()
-	}
+	m.makesureHandshake()
 
 	select {
 	case c := <-m.acceptChan:
-		if e = c.accept(); e != nil {
-			c.CloseCause(e)
-			return
-		}
+		m.writePack(ACCEPT, c.id)
 		return c, nil
 	case <-m.ctx.Done():
 		return nil, net.ErrClosed
@@ -404,20 +419,20 @@ func (m *conn) newSubConn(network, addr string, dialContext context.Context) *su
 	return c
 }
 func (m *conn) DialContext(ctx context.Context, network, addr string) (conn net.Conn, e error) {
-	if m.handshakeContext.Err() == nil {
-		go m.handshake()
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-m.handshakeContext.Done():
-		}
-	}
+	m.makesureHandshake()
 	sc := m.newSubConn(network, addr, ctx)
-	if e = sc.dial(ctx); e != nil {
-		go sc.CloseCause(e)
-		return nil, e
+	m.writeDial(sc.id, &url.URL{Scheme: sc.remoteAddr.Network(), Host: sc.remoteAddr.String()})
+
+	select {
+	case <-ctx.Done():
+		go sc.CloseCause(ctx.Err())
+		return nil, ctx.Err()
+	case <-sc.dialing.Done():
+		if sc.ctx.Err() != nil {
+			return nil, sc.ctx.Err()
+		}
+		return sc, nil
 	}
-	return sc, nil
 }
 
 func (m *conn) clearSubConn(c *subConn) {
@@ -425,19 +440,43 @@ func (m *conn) clearSubConn(c *subConn) {
 	defer m.subConnLock.Unlock()
 	delete(m.subConns, c.id)
 }
-func (m *conn) writeAsync(b []byte) (n <-chan mioDataMessage) {
-	ch := make(chan mioDataMessage, 1)
-	m.writeChan <- mioDataMessage{[]byte{}, b, 0, nil, ch}
-	return ch
+func (m *conn) writePack(packType PackType, id uint16) {
+	m.writeChan <- msgPool.Get().(*writeMsg).Apply(packType, id, nil, nil)
+}
+func (m *conn) writeDial(id uint16, u *url.URL) {
+	m.writeChan <- msgPool.Get().(*writeMsg).Apply(DIAL, id, []byte(u.String()), nil)
+}
+func (m *conn) writeData(ctx context.Context, id uint16, data []byte) (n int, err error) {
+	replyTo := resultPool.Get().(chan writeResult)
+	select {
+	case m.writeChan <- msgPool.Get().(*writeMsg).Apply(DATA, id, data, replyTo):
+		result := <-replyTo
+		resultPool.Put(replyTo)
+		return result.N, result.Error
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
 }
 
-type mioDataMessage struct {
-	DataPrefix []byte
+var resultPool sync.Pool = sync.Pool{New: func() any { return make(chan writeResult) }}
+var msgPool sync.Pool = sync.Pool{New: func() any { return &writeMsg{} }}
 
-	Data []byte
+type writeResult struct {
+	N     int
+	Error error
+}
 
-	N   int
-	Err error
+type writeMsg struct {
+	Type    PackType
+	ID      uint16
+	Data    []byte
+	ReplyTo chan writeResult
+}
 
-	ReplyTo chan mioDataMessage
+func (m *writeMsg) Apply(Type PackType, ID uint16, Data []byte, ReplyTo chan writeResult) *writeMsg {
+	m.Type, m.ID, m.Data, m.ReplyTo = Type, ID, Data, ReplyTo
+	return m
+}
+func (m *writeMsg) Reset() *writeMsg {
+	return m.Apply(NOOP, 0, nil, nil)
 }
