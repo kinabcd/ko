@@ -256,7 +256,8 @@ func (p *Server) serveOthers(wr http.ResponseWriter, req *http.Request) {
 	var resBody io.ReadCloser = resp.Body
 	var bodyWriter io.Writer = wr
 
-	isClientTransferChunkAllowed := !(req.ProtoMajor == 1 && req.ProtoMinor == 0)
+	isEventStream := resp.Header.Get("Content-Type") == "text/event-stream"
+	isClientTransferChunkAllowed := !(req.ProtoMajor == 1 && req.ProtoMinor == 0) && !isEventStream
 	acceptEncoding := strings.Split(strings.Join(req.Header.Values("Accept-Encoding"), ","), ",")
 	for i := range acceptEncoding {
 		acceptEncoding[i] = strings.TrimSpace(acceptEncoding[i])
@@ -273,6 +274,13 @@ func (p *Server) serveOthers(wr http.ResponseWriter, req *http.Request) {
 
 	copyHeader(wr.Header(), resp.Header)
 	wr.WriteHeader(resp.StatusCode)
+	if isEventStream {
+		if f, ok := wr.(http.Flusher); ok {
+			f.Flush()
+			bodyWriter = &flushWriter{Writer: bodyWriter, Flusher: f}
+		}
+	}
+
 	io.Copy(bodyWriter, resBody)
 }
 
@@ -302,7 +310,7 @@ func (p *Server) serveConnect(wr http.ResponseWriter, req *http.Request) {
 				outConn.Close()
 				req.Body.Close()
 			}()
-			io.Copy(&flushWriter{wr, rc}, outConn)
+			io.Copy(&flushWriter{Writer: wr, ResponseController: rc}, outConn)
 			return
 		}
 		rc.EnableFullDuplex()
@@ -327,12 +335,18 @@ func (p *Server) serveConnect(wr http.ResponseWriter, req *http.Request) {
 type flushWriter struct {
 	io.Writer
 	*http.ResponseController
+	http.Flusher
 }
 
 func (f *flushWriter) Write(p []byte) (n int, err error) {
 	n, err = f.Writer.Write(p)
-	if err == nil {
+	if err != nil {
+		return
+	}
+	if f.ResponseController != nil {
 		err = f.ResponseController.Flush()
+	} else if f.Flusher != nil {
+		f.Flusher.Flush()
 	}
 	return
 }
