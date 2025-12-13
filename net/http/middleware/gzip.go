@@ -8,7 +8,7 @@ import (
 
 func Gzip(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+		if !IsGzipAllowed(w, r) {
 			next.ServeHTTP(w, r) // Client doesn't accept gzip, serve normally
 			return
 		}
@@ -22,6 +22,19 @@ func Gzip(next http.Handler) http.Handler {
 
 		next.ServeHTTP(gzw, r) // Serve the request with the gzipped writer
 	})
+}
+func IsGzipAllowed(w http.ResponseWriter, r *http.Request) bool {
+	acceptGzip := func(r *http.Request) bool {
+		for _, aes := range r.Header.Values("Accept-Encoding") {
+			for sps := range strings.SplitSeq(aes, ",") {
+				if strings.TrimSpace(sps) == "gzip" {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	return w.Header().Get("Content-Encoding") == "" && acceptGzip(r)
 }
 
 // gzipResponseWriter wraps http.ResponseWriter to enable gzip compression.
