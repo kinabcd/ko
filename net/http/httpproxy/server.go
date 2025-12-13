@@ -211,10 +211,9 @@ func (p *Server) serveOthers(wr http.ResponseWriter, req *http.Request) {
 	if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
 		msg := "unsupported protocal scheme " + req.URL.Scheme
 		http.Error(wr, msg, http.StatusBadRequest)
-		p.logW(msg)
+		p.logW(req.Method, slog.Any("url", req.URL), slog.String("proto", req.Proto), slog.String("err", msg))
 		return
 	}
-	p.logD(req.Method, slog.Any("url", req.URL), slog.String("proto", req.Proto))
 
 	dialContext := koNet.DialContextFunc(nil)
 	if p.Dialer != nil {
@@ -245,8 +244,8 @@ func (p *Server) serveOthers(wr http.ResponseWriter, req *http.Request) {
 
 	resp, err := p.client.Do(req)
 	if err != nil {
-		http.Error(wr, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-		p.logW(err.Error())
+		http.Error(wr, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
+		p.logW(req.Method, slog.Any("url", req.URL), slog.String("proto", req.Proto), slog.Any("err", err))
 		return
 	}
 	defer resp.Body.Close()
@@ -260,6 +259,7 @@ func (p *Server) serveOthers(wr http.ResponseWriter, req *http.Request) {
 	isEventStream := resp.Header.Get("Content-Type") == "text/event-stream"
 	isChunkAllowed := !(req.ProtoMajor == 1 && req.ProtoMinor == 0) && !isEventStream
 	isBufferAllowed := !isEventStream
+	logAttrs := []any{slog.Any("url", req.URL), slog.String("proto", req.Proto)}
 	if p.ProxyCompression && isChunkAllowed && middleware.IsGzipAllowed(wr, req) {
 		// Client accepts gzip, but server does not send gzip. compress it.
 		wr.Header().Set("Content-Encoding", "gzip")
@@ -267,6 +267,7 @@ func (p *Server) serveOthers(wr http.ResponseWriter, req *http.Request) {
 		gzipWriter := gzip.NewWriter(wr)
 		defer gzipWriter.Close()
 		bodyWriter = gzipWriter
+		logAttrs = append(logAttrs, slog.String("ProxyCompression", "gzip"))
 	}
 
 	wr.WriteHeader(resp.StatusCode)
@@ -274,9 +275,11 @@ func (p *Server) serveOthers(wr http.ResponseWriter, req *http.Request) {
 		if f, ok := wr.(http.Flusher); ok {
 			f.Flush()
 			bodyWriter = &flushWriter{Writer: bodyWriter, Flusher: f}
+			logAttrs = append(logAttrs, slog.String("Flush", "true"))
 		}
 	}
 
+	p.logD(req.Method, logAttrs...)
 	io.Copy(bodyWriter, resBody)
 }
 
