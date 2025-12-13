@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -15,6 +14,7 @@ import (
 	koIo "github.com/kinabcd/ko/io"
 	koNet "github.com/kinabcd/ko/net"
 	koHttp "github.com/kinabcd/ko/net/http"
+	"github.com/kinabcd/ko/net/http/middleware"
 )
 
 // Hop-by-hop headers. These are removed when sent to the backend.
@@ -252,29 +252,25 @@ func (p *Server) serveOthers(wr http.ResponseWriter, req *http.Request) {
 	defer resp.Body.Close()
 
 	delHopHeaders(resp.Header)
+	copyHeader(wr.Header(), resp.Header)
 
 	var resBody io.ReadCloser = resp.Body
 	var bodyWriter io.Writer = wr
 
 	isEventStream := resp.Header.Get("Content-Type") == "text/event-stream"
-	isClientTransferChunkAllowed := !(req.ProtoMajor == 1 && req.ProtoMinor == 0) && !isEventStream
-	acceptEncoding := strings.Split(strings.Join(req.Header.Values("Accept-Encoding"), ","), ",")
-	for i := range acceptEncoding {
-		acceptEncoding[i] = strings.TrimSpace(acceptEncoding[i])
-	}
-	if p.ProxyCompression && isClientTransferChunkAllowed &&
-		resp.Header.Get("Content-Encoding") == "" && slices.Contains(acceptEncoding, "gzip") {
+	isChunkAllowed := !(req.ProtoMajor == 1 && req.ProtoMinor == 0) && !isEventStream
+	isBufferAllowed := !isEventStream
+	if p.ProxyCompression && isChunkAllowed && middleware.IsGzipAllowed(wr, req) {
 		// Client accepts gzip, but server does not send gzip. compress it.
-		resp.Header.Set("Content-Encoding", "gzip")
-		resp.Header.Del("Content-Length")
+		wr.Header().Set("Content-Encoding", "gzip")
+		wr.Header().Del("Content-Length")
 		gzipWriter := gzip.NewWriter(wr)
 		defer gzipWriter.Close()
 		bodyWriter = gzipWriter
 	}
 
-	copyHeader(wr.Header(), resp.Header)
 	wr.WriteHeader(resp.StatusCode)
-	if isEventStream {
+	if !isBufferAllowed {
 		if f, ok := wr.(http.Flusher); ok {
 			f.Flush()
 			bodyWriter = &flushWriter{Writer: bodyWriter, Flusher: f}
