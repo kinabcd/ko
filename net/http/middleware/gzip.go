@@ -34,7 +34,10 @@ func IsGzipAllowed(w http.ResponseWriter, r *http.Request) bool {
 		}
 		return false
 	}
-	return w.Header().Get("Content-Encoding") == "" && acceptGzip(r)
+	isWebsocket := func(r *http.Request) bool {
+		return r.Header.Get("Connection") == "Upgrade" && r.Header.Get("Upgrade") == "websocket"
+	}
+	return !isWebsocket(r) && w.Header().Get("Content-Encoding") == "" && acceptGzip(r)
 }
 
 // gzipResponseWriter wraps http.ResponseWriter to enable gzip compression.

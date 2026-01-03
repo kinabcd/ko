@@ -32,7 +32,10 @@ func IsDeflateAllowed(w http.ResponseWriter, r *http.Request) bool {
 		}
 		return false
 	}
-	return w.Header().Get("Content-Encoding") == "" && isAccepted(r)
+	isWebsocket := func(r *http.Request) bool {
+		return r.Header.Get("Connection") == "Upgrade" && r.Header.Get("Upgrade") == "websocket"
+	}
+	return !isWebsocket(r) && w.Header().Get("Content-Encoding") == "" && isAccepted(r)
 }
 
 // deflateResponseWriter wraps http.ResponseWriter to enable deflate compression.
