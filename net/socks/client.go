@@ -51,7 +51,7 @@ func (d *Client) DialContext(ctx context.Context, network, address string) (net.
 	if err != nil {
 		return nil, d.newOpError(network, address, err)
 	}
-	return &koNet.OverrideConn{Conn: c, OverrideLocalAddr: a}, nil
+	return koNet.DecorateConn(c).WithLocalAddr(a), nil
 }
 
 // DialWithConn initiates a connection from SOCKS server to the target
@@ -73,8 +73,8 @@ func (d *Client) DialWithConn(ctx context.Context, c net.Conn, network, address 
 }
 
 func (d *Client) newOpError(network, address string, err error) error {
-	proxy := &koNet.OverrideAddr{OverrideNetwork: d.ProxyUrl.Scheme, OverrideAddress: d.ProxyUrl.Host}
-	dst := &koNet.OverrideAddr{OverrideNetwork: network, OverrideAddress: address}
+	proxy := koNet.NewStaticAddr(d.ProxyUrl.Scheme, d.ProxyUrl.Host)
+	dst := koNet.NewStaticAddr(network, address)
 	return &net.OpError{Op: d.Cmd.String(), Net: network, Source: proxy, Addr: dst, Err: err}
 }
 func (d *Client) fillDefault() {
@@ -164,8 +164,5 @@ func (d *Client) connect(ctx context.Context, c net.Conn, address string) (net.A
 	if err != nil {
 		return e(err)
 	}
-	return &koNet.OverrideAddr{
-		OverrideNetwork: "socks",
-		OverrideAddress: resAddress,
-	}, nil
+	return koNet.NewStaticAddr("socks", resAddress), nil
 }

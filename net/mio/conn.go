@@ -229,7 +229,7 @@ func (m *conn) processNextPack() (err error) {
 		} else if u, err = url.Parse(str); err != nil {
 			return
 		} else {
-			localAddr = &subAddr{network: u.Scheme, address: u.Host}
+			localAddr = koNet.NewStaticAddr(u.Scheme, u.Host)
 		}
 		c := newMioSubConn(m.ctx, id, m, localAddr, m.conn.RemoteAddr(), context.Background())
 		m.subConns[c.id] = c
@@ -414,7 +414,7 @@ func (m *conn) newSubConn(network, addr string, dialContext context.Context) *su
 			break
 		}
 	}
-	c := newMioSubConn(m.ctx, n, m, m.conn.LocalAddr(), &subAddr{network: network, address: addr}, dialContext)
+	c := newMioSubConn(m.ctx, n, m, m.conn.LocalAddr(), koNet.NewStaticAddr(network, addr), dialContext)
 	m.subConns[n] = c
 	return c
 }

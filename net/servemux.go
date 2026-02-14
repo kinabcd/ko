@@ -62,10 +62,7 @@ func (r *ServeMux) Forward(ctx context.Context, c net.Conn) error {
 		c.Close()
 		return errors.New("unknown protocol")
 	} else {
-		return forwarder.Forward(ctx, &PrefixConn{
-			Conn:   c,
-			Prefix: bytes.NewBuffer(buffer[:n]),
-		})
+		return forwarder.Forward(ctx, DecorateConn(c).WithPrefixBytes(buffer[:n]))
 	}
 }
 

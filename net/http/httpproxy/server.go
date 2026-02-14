@@ -324,7 +324,7 @@ func (p *Server) serveConnect(wr http.ResponseWriter, req *http.Request) {
 		if err != nil {
 			p.logW("response failed", slog.Any("err", err))
 		}
-		koIo.BidirectionalCopy(&koNet.PrefixConn{Prefix: brf.Reader, Conn: conn}, outConn)
+		koIo.BidirectionalCopy(koNet.DecorateConn(conn).WithPrefixReader(brf.Reader), outConn)
 	} else {
 		wr.WriteHeader(http.StatusNotFound)
 		p.logW("dial failed", slog.Any("err", err))

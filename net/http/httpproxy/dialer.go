@@ -72,7 +72,7 @@ func (s *Dialer) DialContext(ctx context.Context, network, addr string) (conn ne
 		reader := bufio.NewReader(conn)
 		if resp, err = http.ReadResponse(reader, req); err == nil {
 			if resp.StatusCode == 200 {
-				return &koNet.PrefixConn{Conn: conn, Prefix: reader}, nil
+				return koNet.DecorateConn(conn).WithPrefixReader(reader), nil
 			}
 			err = fmt.Errorf("connect server using proxy error, statusCode %d", resp.StatusCode)
 		} else {

@@ -61,7 +61,7 @@ func (l *PipeListener) Close() (e error) {
 }
 
 // Addr returns the listener's network address.
-func (l *PipeListener) Addr() net.Addr { return pipeAddr{} }
+func (l *PipeListener) Addr() net.Addr { return NewStaticAddr("pipe", "pipe") }
 func (l *PipeListener) Dial(network, addr string) (net.Conn, error) {
 	return l.DialContext(context.Background(), network, addr)
 }
@@ -105,8 +105,3 @@ func (l *PipeListener) Forward(ctx context.Context, conn net.Conn) (e error) {
 	}
 	return
 }
-
-type pipeAddr struct{}
-
-func (pipeAddr) Network() string { return `pipe` }
-func (pipeAddr) String() string  { return `pipe` }
