@@ -17,20 +17,16 @@ func BidirectionalCopy(conn1, conn2 io.ReadWriteCloser) {
 	go func() {
 		defer close(waitDone)
 		_, err := io.Copy(conn1, conn2)
-		if err == nil {
-			if c1, ok := conn1.(ClosableWriter); ok {
-				c1.CloseWrite()
-			}
+		if c1, ok := conn1.(ClosableWriter); ok && err == nil {
+			c1.CloseWrite()
 		} else {
 			conn1.Close()
 			conn2.Close()
 		}
 	}()
 	_, err := io.Copy(conn2, conn1)
-	if err == nil {
-		if c2, ok := conn2.(ClosableWriter); ok {
-			c2.CloseWrite()
-		}
+	if c2, ok := conn2.(ClosableWriter); ok && err == nil {
+		c2.CloseWrite()
 	} else {
 		conn2.Close()
 		conn1.Close()
