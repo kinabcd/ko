@@ -6,7 +6,7 @@ import (
 )
 
 // Bind establishes a bidirectional data transfer between two connections.
-// Two connections will be closed if both is closed.
+// It blocks until both connections are closed.
 func BidirectionalCopy(conn1, conn2 io.ReadWriteCloser) {
 	defer conn2.Close()
 	defer conn1.Close()
