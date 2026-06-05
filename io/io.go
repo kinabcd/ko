@@ -6,16 +6,36 @@ import (
 )
 
 // Bind establishes a bidirectional data transfer between two connections.
-// Two connections will be closed if anyone is closed.
+// Two connections will be closed if both is closed.
 func BidirectionalCopy(conn1, conn2 io.ReadWriteCloser) {
+	defer conn2.Close()
+	defer conn1.Close()
+	type ClosableWriter interface {
+		CloseWrite() error
+	}
+	waitDone := make(chan struct{})
 	go func() {
-		io.Copy(conn1, conn2)
-		conn1.Close()
-		conn2.Close()
+		defer close(waitDone)
+		_, err := io.Copy(conn1, conn2)
+		if err == nil {
+			if c1, ok := conn1.(ClosableWriter); ok {
+				c1.CloseWrite()
+			}
+		} else {
+			conn1.Close()
+			conn2.Close()
+		}
 	}()
-	io.Copy(conn2, conn1)
-	conn2.Close()
-	conn1.Close()
+	_, err := io.Copy(conn2, conn1)
+	if err == nil {
+		if c2, ok := conn2.(ClosableWriter); ok {
+			c2.CloseWrite()
+		}
+	} else {
+		conn2.Close()
+		conn1.Close()
+	}
+	<-waitDone
 }
 
 // ReadByte reads and returns the next byte from the Reader or any error encountered.

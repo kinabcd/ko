@@ -29,6 +29,8 @@ const (
 	DATA   PackType = 4
 	PING   PackType = 5
 	ACK    PackType = 6
+	CLOSEW PackType = 7
+	CLOSER PackType = 8
 )
 
 type conn struct {
@@ -295,6 +297,18 @@ func (m *conn) processNextPack() (err error) {
 		defer m.subConnLock.Unlock()
 		if c, ok := m.subConns[id]; ok {
 			c.writeAckChan <- struct{}{}
+		}
+	case CLOSER:
+		m.subConnLock.Lock()
+		defer m.subConnLock.Unlock()
+		if c, ok := m.subConns[id]; ok {
+			c.closeWrite()
+		}
+	case CLOSEW:
+		m.subConnLock.Lock()
+		defer m.subConnLock.Unlock()
+		if c, ok := m.subConns[id]; ok {
+			c.closeRead()
 		}
 	}
 	return nil

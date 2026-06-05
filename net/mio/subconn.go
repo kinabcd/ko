@@ -40,12 +40,20 @@ type subConn struct {
 	readAckCount  uint16
 	writeAckCount uint16
 	writeAckChan  chan struct{}
+
+	writeCtx   context.Context
+	closeWrite context.CancelFunc
+
+	readCtx   context.Context
+	closeRead context.CancelFunc
 }
 
 func newMioSubConn(ctx context.Context, id uint16, mainConn *conn, localAddr, remoteAddr net.Addr, dialContext context.Context) *subConn {
 	idBytes := binary.BigEndian.AppendUint16([]byte{}, id)
 	baseContext, cancelFunc := context.WithCancelCause(ctx)
 	dialing, dialingDone := context.WithCancel(baseContext)
+	writeCtx, closeWrite := context.WithCancel(baseContext)
+	readCtx, closeRead := context.WithCancel(baseContext)
 	return &subConn{
 		id:          id,
 		idBytes:     idBytes,
@@ -57,6 +65,12 @@ func newMioSubConn(ctx context.Context, id uint16, mainConn *conn, localAddr, re
 
 		ctx:   baseContext,
 		close: cancelFunc,
+
+		writeCtx:   writeCtx,
+		closeWrite: closeWrite,
+
+		readCtx:   readCtx,
+		closeRead: closeRead,
 
 		readChan: make(chan []byte, 1024),
 
@@ -102,9 +116,6 @@ func (m *subConn) ackRead() {
 
 // Read implements net.Conn.
 func (m *subConn) Read(b []byte) (n int, err error) {
-	if m.ctx.Err() != nil {
-		return 0, m.ctx.Err()
-	}
 	deadLine := context.Background()
 	if !m.readDeadline.Equal(time.Time{}) {
 		var cancelFunc func()
@@ -115,10 +126,17 @@ func (m *subConn) Read(b []byte) (n int, err error) {
 		select {
 		case m.readBuf = <-m.readChan:
 			m.ackRead()
-		case <-m.ctx.Done():
-			return 0, m.ctx.Err()
-		case <-deadLine.Done():
-			return 0, os.ErrDeadlineExceeded
+		default:
+			select {
+			case m.readBuf = <-m.readChan:
+				m.ackRead()
+			case <-m.ctx.Done():
+				return 0, m.ctx.Err()
+			case <-deadLine.Done():
+				return 0, os.ErrDeadlineExceeded
+			case <-m.readCtx.Done():
+				return 0, io.EOF
+			}
 		}
 	}
 
@@ -141,10 +159,17 @@ func (m *subConn) WriteTo(w io.Writer) (n int64, err error) {
 			select {
 			case m.readBuf = <-m.readChan:
 				m.ackRead()
-			case <-m.ctx.Done():
-				return n, m.ctx.Err()
-			case <-deadLine.Done():
-				return 0, os.ErrDeadlineExceeded
+			default:
+				select {
+				case m.readBuf = <-m.readChan:
+					m.ackRead()
+				case <-m.ctx.Done():
+					return n, m.ctx.Err()
+				case <-deadLine.Done():
+					return 0, os.ErrDeadlineExceeded
+				case <-m.readCtx.Done():
+					return 0, io.EOF
+				}
 			}
 		}
 		nn, err = w.Write(m.readBuf)
@@ -160,6 +185,9 @@ func (m *subConn) WriteTo(w io.Writer) (n int64, err error) {
 func (m *subConn) Write(b []byte) (n int, err error) {
 	if m.ctx.Err() != nil {
 		return 0, m.ctx.Err()
+	}
+	if m.writeCtx.Err() != nil {
+		return 0, net.ErrClosed
 	}
 	n = 0
 	ctx := m.ctx
@@ -177,6 +205,8 @@ func (m *subConn) Write(b []byte) (n int, err error) {
 				m.writeAckCount -= 128
 			case <-ctx.Done():
 				return n, ctx.Err()
+			case <-m.writeCtx.Done():
+				return n, net.ErrClosed
 			}
 		}
 		wn := min(len(b)-n, maxSize)
@@ -231,4 +261,26 @@ func (m *subConn) Context() context.Context {
 	} else {
 		return context.Background()
 	}
+}
+
+func (m *subConn) CloseWrite() error {
+	if m.writeCtx.Err() == nil {
+		m.mainConn.writePack(CLOSEW, m.id)
+		m.closeWrite()
+		if m.readCtx.Err() != nil {
+			return m.Close()
+		}
+	}
+	return nil
+}
+
+func (m *subConn) CloseRead() error {
+	if m.readCtx.Err() == nil {
+		m.mainConn.writePack(CLOSER, m.id)
+		m.closeRead()
+		if m.writeCtx.Err() != nil {
+			return m.Close()
+		}
+	}
+	return nil
 }

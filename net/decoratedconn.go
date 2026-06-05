@@ -6,12 +6,9 @@ import (
 	"net"
 )
 
-var (
-	_ io.Reader     = (*decoratedConn)(nil)
-	_ io.Writer     = (*decoratedConn)(nil)
-	_ io.ReaderFrom = (*decoratedConn)(nil)
-	_ io.WriterTo   = (*decoratedConn)(nil)
-)
+var _ io.ReadWriteCloser = (*decoratedConn)(nil)
+var _ io.ReaderFrom = (*decoratedConn)(nil)
+var _ io.WriterTo = (*decoratedConn)(nil)
 
 type decoratedConn struct {
 	net.Conn
