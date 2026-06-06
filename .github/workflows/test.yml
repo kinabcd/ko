@@ -2,12 +2,11 @@ name: Tests
 
 on:
   push:
-    tags:
-    branches:
+    tags: ["v*"]
+    branches: ["*"]
   pull_request:
 
 jobs:
-
   test:
     runs-on: ubuntu-latest
     env:
@@ -15,17 +14,17 @@ jobs:
     strategy:
       matrix:
         go:
-          - '1.x'
+          - "1.x"
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-    - name: Set up Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: ${{ matrix.go }}
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go }}
 
-    - name: Build
-      run: make build
+      - name: Build
+        run: go build -v ./...
 
-    - name: Test
-      run: make test
+      - name: Test
+        run: go test -race -v ./...
